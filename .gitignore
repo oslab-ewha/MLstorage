@@ -1,2 +1,14 @@
-*.o
 *~
+*.swp
+*.cmd
+*.o
+*.o.d
+*.ko
+*.ur-safe
+.cache.mk
+cscope.out
+modules.order
+Module.symvers
+/cscope.files
+*.mod.c
+.tmp_versions
