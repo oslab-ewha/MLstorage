@@ -12,6 +12,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
 #include <linux/blkpg.h>
 #include <linux/bio.h>
@@ -516,7 +517,7 @@ static void start_io_acct(struct dm_io *io)
 	io->start_time = jiffies;
 
 	cpu = part_stat_lock();
-	part_round_stats(cpu, &dm_disk(md)->part0);
+	part_round_stats(md->queue, cpu, &dm_disk(md)->part0);
 	part_stat_unlock();
 	atomic_set(&dm_disk(md)->part0.in_flight[rw],
 		atomic_inc_return(&md->pending[rw]));
@@ -535,7 +536,7 @@ static void end_io_acct(struct dm_io *io)
 	int pending;
 	int rw = bio_data_dir(bio);
 
-	generic_end_io_acct(rw, &dm_disk(md)->part0, io->start_time);
+	generic_end_io_acct(md->queue, rw, &dm_disk(md)->part0, io->start_time);
 
 	if (unlikely(dm_stats_used(&md->stats)))
 		dm_stats_account_io(&md->stats, bio_data_dir(bio),
@@ -815,7 +816,8 @@ static void dec_pending(struct dm_io *io, blk_status_t error)
 			queue_io(md, bio);
 		} else {
 			/* done with normal IO or empty flush */
-			bio->bi_status = io_error;
+			if (io_error)
+				bio->bi_status = io_error;
 			bio_endio(bio);
 		}
 	}
@@ -847,10 +849,10 @@ static void clone_endio(struct bio *bio)
 
 	if (unlikely(error == BLK_STS_TARGET)) {
 		if (bio_op(bio) == REQ_OP_WRITE_SAME &&
-		    !bdev_get_queue(bio->bi_bdev)->limits.max_write_same_sectors)
+		    !bio->bi_disk->queue->limits.max_write_same_sectors)
 			disable_write_same(md);
 		if (bio_op(bio) == REQ_OP_WRITE_ZEROES &&
-		    !bdev_get_queue(bio->bi_bdev)->limits.max_write_zeroes_sectors)
+		    !bio->bi_disk->queue->limits.max_write_zeroes_sectors)
 			disable_write_zeroes(md);
 	}
 
@@ -960,8 +962,7 @@ static long dm_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
 	if (len < 1)
 		goto out;
 	nr_pages = min(len, nr_pages);
-	if (ti->type->direct_access)
-		ret = ti->type->direct_access(ti, pgoff, nr_pages, kaddr, pfn);
+	ret = ti->type->direct_access(ti, pgoff, nr_pages, kaddr, pfn);
 
  out:
 	dm_put_live_table(md, srcu_idx);
@@ -1034,12 +1035,14 @@ void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
 EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
 
 /*
- * The zone descriptors obtained with a zone report indicate
- * zone positions within the target device. The zone descriptors
- * must be remapped to match their position within the dm device.
- * A target may call dm_remap_zone_report after completion of a
- * REQ_OP_ZONE_REPORT bio to remap the zone descriptors obtained
- * from the target device mapping to the dm device.
+ * The zone descriptors obtained with a zone report indicate zone positions
+ * within the target backing device, regardless of that device is a partition
+ * and regardless of the target mapping start sector on the device or partition.
+ * The zone descriptors start sector and write pointer position must be adjusted
+ * to match their relative position within the dm device.
+ * A target may call dm_remap_zone_report() after completion of a
+ * REQ_OP_ZONE_REPORT bio to remap the zone descriptors obtained from the
+ * backing device.
  */
 void dm_remap_zone_report(struct dm_target *ti, struct bio *bio, sector_t start)
 {
@@ -1050,12 +1053,22 @@ void dm_remap_zone_report(struct dm_target *ti, struct bio *bio, sector_t start)
 	struct blk_zone *zone;
 	unsigned int nr_rep = 0;
 	unsigned int ofst;
+	sector_t part_offset;
 	struct bio_vec bvec;
 	struct bvec_iter iter;
 	void *addr;
 
 	if (bio->bi_status)
 		return;
+
+	/*
+	 * bio sector was incremented by the request size on completion. Taking
+	 * into account the original request sector, the target start offset on
+	 * the backing device and the target mapping offset (ti->begin), the
+	 * start sector of the backing device. The partition offset is always 0
+	 * if the target uses a whole device.
+	 */
+	part_offset = bio->bi_iter.bi_sector + ti->begin - (start + bio_end_sector(report_bio));
 
 	/*
 	 * Remap the start sector of the reported zones. For sequential zones,
@@ -1074,6 +1087,7 @@ void dm_remap_zone_report(struct dm_target *ti, struct bio *bio, sector_t start)
 		/* Set zones start sector */
 		while (hdr->nr_zones && ofst < bvec.bv_len) {
 			zone = addr + ofst;
+			zone->start -= part_offset;
 			if (zone->start >= start + ti->len) {
 				hdr->nr_zones = 0;
 				break;
@@ -1085,7 +1099,7 @@ void dm_remap_zone_report(struct dm_target *ti, struct bio *bio, sector_t start)
 				else if (zone->cond == BLK_ZONE_COND_EMPTY)
 					zone->wp = zone->start;
 				else
-					zone->wp = zone->wp + ti->begin - start;
+					zone->wp = zone->wp + ti->begin - start - part_offset;
 			}
 			ofst += sizeof(struct blk_zone);
 			hdr->nr_zones--;
@@ -1193,8 +1207,8 @@ static void __map_bio(struct dm_target_io *tio)
 		break;
 	case DM_MAPIO_REMAPPED:
 		/* the bio has been remapped so dispatch it */
-		trace_block_bio_remap(bdev_get_queue(clone->bi_bdev), clone,
-				      tio->io->bio->bi_bdev->bd_dev, sector);
+		trace_block_bio_remap(clone->bi_disk->queue, clone,
+				      bio_dev(tio->io->bio), sector);
 		generic_make_request(clone);
 		break;
 	case DM_MAPIO_KILL:
@@ -1520,7 +1534,7 @@ static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
 
 	map = dm_get_live_table(md, &srcu_idx);
 
-	generic_start_io_acct(rw, bio_sectors(bio), &dm_disk(md)->part0);
+	generic_start_io_acct(q, rw, bio_sectors(bio), &dm_disk(md)->part0);
 
 	/* if we're suspended, we have to queue this io for later */
 	if (unlikely(test_bit(DMF_BLOCK_IO_FOR_SUSPEND, &md->flags))) {
@@ -1634,7 +1648,6 @@ void dm_init_md_queue(struct mapped_device *md)
 	 * - must do so here (in alloc_dev callchain) before queue is used
 	 */
 	md->queue->queuedata = md;
-	md->queue->backing_dev_info->congested_data = md;
 }
 
 void dm_init_normal_md_queue(struct mapped_device *md)
@@ -1645,6 +1658,7 @@ void dm_init_normal_md_queue(struct mapped_device *md)
 	/*
 	 * Initialize aspects of queue that aren't relevant for blk-mq
 	 */
+	md->queue->backing_dev_info->congested_data = md;
 	md->queue->backing_dev_info->congested_fn = dm_any_congested;
 }
 
@@ -1695,7 +1709,7 @@ static struct mapped_device *alloc_dev(int minor)
 	struct mapped_device *md;
 	void *old_md;
 
-	md = kzalloc_node(sizeof(*md), GFP_KERNEL, numa_node_id);
+	md = kvzalloc_node(sizeof(*md), GFP_KERNEL, numa_node_id);
 	if (!md) {
 		DMWARN("unable to allocate device, out of memory.");
 		return NULL;
@@ -1737,6 +1751,12 @@ static struct mapped_device *alloc_dev(int minor)
 		goto bad;
 
 	dm_init_md_queue(md);
+	/*
+	 * default to bio-based required ->make_request_fn until DM
+	 * table is loaded and md->type established. If request-based
+	 * table is loaded: blk-mq will override accordingly.
+	 */
+	blk_queue_make_request(md->queue, dm_make_request);
 
 	md->disk = alloc_disk_node(1, numa_node_id);
 	if (!md->disk)
@@ -1774,7 +1794,7 @@ static struct mapped_device *alloc_dev(int minor)
 		goto bad;
 
 	bio_init(&md->flush_bio, NULL, 0);
-	md->flush_bio.bi_bdev = md->bdev;
+	bio_set_dev(&md->flush_bio, md->bdev);
 	md->flush_bio.bi_opf = REQ_OP_WRITE | REQ_PREFLUSH | REQ_SYNC;
 
 	dm_stats_init(&md->stats);
@@ -1795,7 +1815,7 @@ bad_io_barrier:
 bad_minor:
 	module_put(THIS_MODULE);
 bad_module_get:
-	kfree(md);
+	kvfree(md);
 	return NULL;
 }
 
@@ -1814,7 +1834,7 @@ static void free_dev(struct mapped_device *md)
 	free_minor(minor);
 
 	module_put(THIS_MODULE);
-	kfree(md);
+	kvfree(md);
 }
 
 static void __bind_mempools(struct mapped_device *md, struct dm_table *t)
@@ -2042,16 +2062,12 @@ int dm_setup_md_queue(struct mapped_device *md, struct dm_table *t)
 	case DM_TYPE_BIO_BASED:
 	case DM_TYPE_DAX_BIO_BASED:
 		dm_init_normal_md_queue(md);
-		blk_queue_make_request(md->queue, dm_make_request);
 		/*
 		 * DM handles splitting bios as needed.  Free the bio_split bioset
 		 * since it won't be used (saves 1 process per bio-based DM device).
 		 */
 		bioset_free(md->queue->bio_split);
 		md->queue->bio_split = NULL;
-
-		if (type == DM_TYPE_DAX_BIO_BASED)
-			queue_flag_set_unlocked(QUEUE_FLAG_DAX, md->queue);
 		break;
 	case DM_TYPE_NONE:
 		WARN_ON_ONCE(true);
@@ -2650,17 +2666,25 @@ EXPORT_SYMBOL_GPL(dm_internal_resume_fast);
 int dm_kobject_uevent(struct mapped_device *md, enum kobject_action action,
 		       unsigned cookie)
 {
+	int r;
+	unsigned noio_flag;
 	char udev_cookie[DM_COOKIE_LENGTH];
 	char *envp[] = { udev_cookie, NULL };
 
+	noio_flag = memalloc_noio_save();
+
 	if (!cookie)
-		return kobject_uevent(&disk_to_dev(md->disk)->kobj, action);
+		r = kobject_uevent(&disk_to_dev(md->disk)->kobj, action);
 	else {
 		snprintf(udev_cookie, DM_COOKIE_LENGTH, "%s=%u",
 			 DM_COOKIE_ENV_VAR_NAME, cookie);
-		return kobject_uevent_env(&disk_to_dev(md->disk)->kobj,
-					  action, envp);
+		r = kobject_uevent_env(&disk_to_dev(md->disk)->kobj,
+				       action, envp);
 	}
+
+	memalloc_noio_restore(noio_flag);
+
+	return r;
 }
 
 uint32_t dm_next_uevent_seq(struct mapped_device *md)
@@ -2709,11 +2733,15 @@ struct mapped_device *dm_get_from_kobject(struct kobject *kobj)
 
 	md = container_of(kobj, struct mapped_device, kobj_holder.kobj);
 
-	if (test_bit(DMF_FREEING, &md->flags) ||
-	    dm_deleting_md(md))
-		return NULL;
-
+	spin_lock(&_minor_lock);
+	if (test_bit(DMF_FREEING, &md->flags) || dm_deleting_md(md)) {
+		md = NULL;
+		goto out;
+	}
 	dm_get(md);
+out:
+	spin_unlock(&_minor_lock);
+
 	return md;
 }
 
