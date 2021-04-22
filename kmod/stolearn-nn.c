@@ -16,10 +16,7 @@
  **
  ** SPDX-License-Identifier: GPL-2.0-only
  **
- ** filename: rapiddisk.c
- ** description: RapidDisk is an enhanced Linux RAM disk module to dynamically
- **	 create, remove, and resize non-persistent RAM drives.
- ** created: 1Jun11, petros@petroskoutoupis.com
+ ** filename: stolearn-nn.c
  **
  ******************************************************************************/
 
@@ -37,8 +34,8 @@
 #include <linux/radix-tree.h>
 #include <linux/io.h>
 
-#define VERSION_STR		"7.2.1"
-#define PREFIX			"rapiddisk"
+#define VERSION_STR		"1.0.0"
+#define PREFIX			"stolearn-nn"
 #define BYTES_PER_SECTOR	512
 #define MAX_RDSKS		128
 #define DEFAULT_MAX_SECTS	127
@@ -78,15 +75,15 @@ static int rd_nr = 0;
 int rd_size = 0;
 
 module_param(max_sectors, int, S_IRUGO);
-MODULE_PARM_DESC(max_sectors, " Maximum sectors (in KB) for the request queue. (Default = 127)");
+MODULE_PARM_DESC(max_sectors, " max sectors (in KB) for the request queue. (Default = 127)");
 module_param(nr_requests, int, S_IRUGO);
-MODULE_PARM_DESC(nr_requests, " Number of requests at a given time for the request queue. (Default = 128)");
+MODULE_PARM_DESC(nr_requests, " # of requests at a given time for the request queue. (Default = 128)");
 module_param(rd_nr, int, S_IRUGO);
-MODULE_PARM_DESC(rd_nr, " Maximum number of RapidDisk devices to load on insertion. (Default = 0)");
+MODULE_PARM_DESC(rd_nr, " max number of stolearn-nn devices to load on insertion. (Default = 0)");
 module_param(rd_size, int, S_IRUGO);
-MODULE_PARM_DESC(rd_size, " Size of each RAM disk (in KB) loaded on insertion. (Default = 0)");
+MODULE_PARM_DESC(rd_size, " size of each RAM disk (in KB) loaded on insertion. (Default = 0)");
 module_param(rd_max_nr, int, S_IRUGO);
-MODULE_PARM_DESC(rd_max_nr, " Maximum number of RAM Disks. (Default = 128)");
+MODULE_PARM_DESC(rd_max_nr, " max number of RAM Disks. (Default = 128)");
 
 static int rdsk_do_bvec(struct rdsk_device *, struct page *,
 			unsigned int, unsigned int, bool, sector_t);
@@ -106,10 +103,10 @@ static ssize_t mgmt_show(struct kobject *kobj, struct kobj_attribute *attr,
 	int len;
 	struct rdsk_device *rdsk;
 
-	len = sprintf(buf, "RapidDisk %s\n\nMaximum Number of Attachable Devices: %d\nNumber of Attached Devices: %d\nMax Sectors (KB): %d\nNumber of Requests: %d\n\n",
+	len = sprintf(buf, "Stolearn-NN %s\n\nMaximum Number of Attachable Devices: %d\nNumber of Attached Devices: %d\nMax Sectors (KB): %d\nNumber of Requests: %d\n\n",
 		      VERSION_STR, rd_max_nr, rd_total, max_sectors, nr_requests);
 	list_for_each_entry(rdsk, &rdsk_devices, rdsk_list) {
-		len += sprintf(buf + len, "rd%d\tSize: %llu MBs\tErrors: %lu\n",
+		len += sprintf(buf + len, "stolearn-nn%d\tSize: %llu MBs\tErrors: %lu\n",
 			       rdsk->num, (rdsk->size / 1024 / 1024),
 			       rdsk->error_cnt);
 	}
@@ -133,29 +130,29 @@ static ssize_t mgmt_store(struct kobject *kobj, struct kobj_attribute *attr,
 	}
 	strcpy(buf, buffer);
 
-	if (!strncmp("rapiddisk attach ", buffer, 17)) {
-		ptr = buf + 17;
-		size = (simple_strtoul(ptr, &ptr, 0) * 2);
+	if (!strncmp("stolearn-nn attach ", buffer, 19)) {
+		ptr = buf + 19;
+		size = (simple_strtoul(ptr, &ptr, 0) * 2 * 1024);
 
 		if (attach_device(size) != 0) {
-			pr_err("%s: Unable to attach a new RapidDisk device.\n", PREFIX);
+			pr_err("%s: Unable to attach a new stolearn-nn device.\n", PREFIX);
 			err = -EINVAL;
 		}
-	} else if (!strncmp("rapiddisk detach ", buffer, 17)) {
-		ptr = buf + 17;
+	} else if (!strncmp("stolearn-nn detach ", buffer, 19)) {
+		ptr = buf + 19;
 		num = simple_strtoul(ptr, &ptr, 0);
 
 		if (detach_device(num) != 0) {
-			pr_err("%s: Unable to detach rd%d\n", PREFIX, num);
+			pr_err("%s: Unable to detach stolearn-nn%d\n", PREFIX, num);
 			err = -EINVAL;
 		}
-	} else if (!strncmp("rapiddisk resize ", buffer, 17)) {
-		ptr = buf + 17;
+	} else if (!strncmp("stolearn-nn resize ", buffer, 19)) {
+		ptr = buf + 19;
 		num = simple_strtoul(ptr, &ptr, 0);
-		size = (simple_strtoul(ptr + 1, &ptr, 0) * 2);
+		size = (simple_strtoul(ptr + 1, &ptr, 0) * 2 * 1024);
 
 		if (resize_device(num, size) != 0) {
-			pr_err("%s: Unable to resize rd%d\n", PREFIX, num);
+			pr_err("%s: Unable to resize stolearn-nn%d\n", PREFIX, num);
 			err = -EINVAL;
 		}
 	} else {
@@ -498,7 +495,7 @@ static int attach_device(int size)
 	int num = 0;
 	struct rdsk_device *rdsk, *tmp;
 	struct gendisk *disk;
-	unsigned char *string, name[16];
+	unsigned char *string, name[32];
 
 	if (rd_total >= rd_max_nr) {
 		pr_warn("%s: Reached maximum number of attached disks.\n",
@@ -510,12 +507,12 @@ static int attach_device(int size)
 	if (!string)
 		goto out;
 	list_for_each_entry(tmp, &rdsk_devices, rdsk_list) {
-		sprintf(string, "%srd%d,", string, tmp->num);
+		sprintf(string, "%sstolearn-nn%d,", string, tmp->num);
 		num++;
 	}
 	while (num >= 0) {
 		memset(name, 0x0, sizeof(name));
-		sprintf(name, "rd%d,", num);
+		sprintf(name, "stolearn-nn%d,", num);
                 if (strstr(string, (const char *)name) == NULL) {
                         break;
                 }
@@ -557,13 +554,13 @@ static int attach_device(int size)
 	disk->private_data = rdsk;
 	disk->queue = rdsk->rdsk_queue;
 	disk->flags |= GENHD_FL_SUPPRESS_PARTITION_INFO;
-	sprintf(disk->disk_name, "rd%d", num);
+	sprintf(disk->disk_name, "stolearn-nn%d", num);
 	set_capacity(disk, size);
 
 	add_disk(rdsk->rdsk_disk);
 	list_add_tail(&rdsk->rdsk_list, &rdsk_devices);
 	rd_total++;
-	pr_info("%s: Attached rd%d of %llu bytes in size.\n", PREFIX,
+	pr_info("%s: Attached stolearn-nn%d of %llu bytes in size.\n", PREFIX,
 		num, rdsk->size);
 	return 0;
 
@@ -590,7 +587,7 @@ static int detach_device(int num)
 	rdsk_free_pages(rdsk);
 	kfree(rdsk);
 	rd_total--;
-	pr_info("%s: Detached rd%d.\n", PREFIX, num);
+	pr_info("%s: Detached stolearn-nn%d.\n", PREFIX, num);
 
 	return 0;
 }
@@ -610,7 +607,7 @@ static int resize_device(int num, int size)
 	}
 	set_capacity(rdsk->rdsk_disk, size);
 	rdsk->size = (size * BYTES_PER_SECTOR);
-	pr_info("%s: Resized rd%d of %lu bytes in size.\n", PREFIX, num,
+	pr_info("%s: Resized stolearn-nn%d of %lu bytes in size.\n", PREFIX, num,
 	        (unsigned long)(size * BYTES_PER_SECTOR));
 	return 0;
 }
@@ -627,7 +624,7 @@ static int __init init_rd(void)
 		return rd_ma_no;
 	}
 
-	rdsk_kobj = kobject_create_and_add("rapiddisk", kernel_kobj);
+	rdsk_kobj = kobject_create_and_add("stolearn-nn", kernel_kobj);
 	if (!rdsk_kobj)
 		goto init_failure;
 	retval = sysfs_create_group(rdsk_kobj, &attr_group);
@@ -637,7 +634,7 @@ static int __init init_rd(void)
 	for (i = 0; i < rd_nr; i++) {
 		retval = attach_device(rd_size * 2);
 		if (retval) {
-			pr_err("%s: Failed to load RapidDisk volume rd%d.\n",
+			pr_err("%s: Failed to load stolearn-nn volume stolearn-nn%d.\n",
 			       PREFIX, i);
 			goto init_failure2;
 		}
@@ -665,7 +662,7 @@ module_init(init_rd);
 module_exit(exit_rd);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Petros Koutoupis <petros@petroskoutoupis.com>");
-MODULE_DESCRIPTION("RapidDisk is an enhanced RAM disk block device driver.");
+MODULE_AUTHOR("oslab <oslab@oslab.ewha.ac.kr>");
+MODULE_DESCRIPTION("Stolearn NN is a neural network for learning storage access pattern.");
 MODULE_VERSION(VERSION_STR);
-MODULE_INFO(Copyright, "Copyright 2010 - 2021 Petros Koutoupis");
+MODULE_INFO(Copyright, "Copyleft 2021 OSLAB, Ewha");
