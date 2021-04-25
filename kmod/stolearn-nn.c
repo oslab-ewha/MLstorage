@@ -572,13 +572,24 @@ out:
 	return GENERIC_ERROR;
 }
 
-static int detach_device(int num)
+static struct rdsk_device *
+find_device(int num)
 {
-	struct rdsk_device *rdsk;
+	struct rdsk_device	*rdsk;
 
 	list_for_each_entry(rdsk, &rdsk_devices, rdsk_list)
 		if (rdsk->num == num)
-			break;
+			return rdsk;
+	return NULL;
+}
+
+static int detach_device(int num)
+{
+	struct rdsk_device	*rdsk;
+
+	rdsk = find_device(num);
+	if (rdsk == NULL)
+		return -1;
 
 	list_del(&rdsk->rdsk_list);
 	del_gendisk(rdsk->rdsk_disk);
@@ -594,11 +605,11 @@ static int detach_device(int num)
 
 static int resize_device(int num, int size)
 {
-	struct rdsk_device *rdsk;
+	struct rdsk_device	*rdsk;
 
-	list_for_each_entry(rdsk, &rdsk_devices, rdsk_list)
-		if (rdsk->num == num)
-			break;
+	rdsk = find_device(num);
+	if (rdsk == NULL)
+		return -1;
 
 	if (size <= get_capacity(rdsk->rdsk_disk)) {
 		pr_warn("%s: Please specify a larger size for resizing.\n",
