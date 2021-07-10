@@ -380,9 +380,10 @@ static void copy_from_rdsk(void *dst, struct rdsk_device *rdsk,
 	}
 }
 
-static int rdsk_do_bvec(struct rdsk_device *rdsk, struct page *page,
-			unsigned int len, unsigned int off, bool is_write,
-			sector_t sector){
+static int
+rdsk_do_bvec(struct rdsk_device *rdsk, struct page *page,
+	     unsigned int len, unsigned int off, bool is_write, sector_t sector)
+{
 	void *mem;
 	int err = 0;
 
@@ -405,7 +406,7 @@ out:
 }
 
 int
-rdsk_submit_bio(struct gendisk *disk, sector_t sector, struct bio *bio)
+rdsk_submit_bio(bool is_write, struct gendisk *disk, sector_t sector, struct bio *bio)
 {
 	struct rdsk_device *rdsk = disk->private_data;
 	struct bio_vec bvec;
@@ -424,7 +425,7 @@ rdsk_submit_bio(struct gendisk *disk, sector_t sector, struct bio *bio)
 		int	err;
 
 		err = rdsk_do_bvec(rdsk, bvec.bv_page, len,
-				   bvec.bv_offset, op_is_write(bio_op(bio)), sector);
+				   bvec.bv_offset, is_write, sector);
 		if (err) {
 			rdsk->error_cnt++;
 			return -EIO;

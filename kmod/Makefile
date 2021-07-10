@@ -29,6 +29,9 @@ CP := cp -v
 obj-m += stolearn-nn.o
 obj-m += stolearn-cache.o
 
+# for kernel debug
+# EXTRA_CFLAGS += -g
+
 all:
 	$(MAKE) -C $(KSRC) M=$(CURDIR)
 

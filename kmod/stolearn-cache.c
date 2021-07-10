@@ -160,17 +160,24 @@ static int cache_invalidate_blocks(struct cache_context *, struct bio *);
 static void rc_uncached_io_callback(unsigned long, void *);
 static void rc_start_uncached_io(struct cache_context *, struct bio *);
 
-int rdsk_submit_bio(struct gendisk *disk, sector_t sector, struct bio *bio);
+int rdsk_submit_bio(bool is_write, struct gendisk *disk, sector_t sector, struct bio *bio);
 static void rc_io_callback(unsigned long error, void *context);
 
 static void
-dm_io_async_bvec(struct dm_io_region *where, struct bio *bio, io_notify_fn fn, struct kcached_job *job)
+dm_io_async_bvec(struct dm_io_region *where, int rw, struct bio *bio, io_notify_fn fn, void *context)
 {
-	struct cache_context *dmc = job->dmc;
-	int	err;
+	struct kcached_job *job = (struct kcached_job *)context;
+	struct dm_io_request iorq;
 
-	err = rdsk_submit_bio(dmc->cache_dev->bdev->bd_disk, where->sector, bio);
-	fn(err, job);
+	iorq.bi_op = rw;
+	iorq.bi_op_flags = 0;
+	iorq.mem.type = DM_IO_BIO;
+	iorq.mem.ptr.bio = bio;
+	iorq.notify.fn = fn;
+	iorq.notify.context = context;
+	iorq.client = job->dmc->io_client;
+
+	dm_io(&iorq, 1, where, NULL);
 }
 
 static int jobs_init(void)
@@ -304,14 +311,19 @@ out:
 }
 EXPORT_SYMBOL(rc_io_callback);
 
-static int do_io(struct kcached_job *job)
+static int
+do_io(struct kcached_job *job)
 {
 	struct cache_context *dmc = job->dmc;
 	struct bio *bio = job->bio;
+	int	err;
 
 	ASSERT(job->rw == WRITECACHE);
 	dmc->cache_writes++;
-	dm_io_async_bvec(&job->cache, bio, rc_io_callback, job);
+
+	err = rdsk_submit_bio(true, dmc->cache_dev->bdev->bd_disk, job->cache.sector, bio);
+	rc_io_callback(err, job);
+
 	return 0;
 }
 
@@ -516,11 +528,12 @@ static void cache_read_miss(struct cache_context *dmc,
 		job->rw = READSOURCE;
 		atomic_inc(&dmc->nr_jobs);
 		dmc->disk_reads++;
-		dm_io_async_bvec(&job->disk, bio, rc_io_callback, job);
+		dm_io_async_bvec(&job->disk, READ, bio, rc_io_callback, job);
 	}
 }
 
-static void cache_read(struct cache_context *dmc, struct bio *bio)
+static void
+cache_read(struct cache_context *dmc, struct bio *bio)
 {
 	int index;
 	int res;
@@ -544,10 +557,13 @@ static void cache_read(struct cache_context *dmc, struct bio *bio)
 			bio->bi_status = -EIO;
 			bio_io_error(bio);
 		} else {
+			int	err;
+
 			job->rw = READCACHE;
 			atomic_inc(&dmc->nr_jobs);
 			dmc->cache_reads++;
-			dm_io_async_bvec(&job->cache, bio, rc_io_callback, job);
+			err = rdsk_submit_bio(false, dmc->cache_dev->bdev->bd_disk, job->cache.sector, bio);
+			rc_io_callback(err, job);
 		}
 		return;
 	}
@@ -674,12 +690,13 @@ static void cache_write(struct cache_context *dmc, struct bio *bio)
 	job->rw = WRITESOURCE;
 	atomic_inc(&job->dmc->nr_jobs);
 	dmc->disk_writes++;
-	dm_io_async_bvec(&job->disk, bio, rc_io_callback, job);
+	dm_io_async_bvec(&job->disk, WRITE, bio, rc_io_callback, job);
 }
 
 #define bio_barrier(bio)		((bio)->bi_opf & REQ_PREFLUSH)
 
-int rc_map(struct dm_target *ti, struct bio *bio)
+int
+rc_map(struct dm_target *ti, struct bio *bio)
 {
 	struct cache_context *dmc = (struct cache_context *)ti->private;
 	unsigned long flags;
@@ -695,7 +712,6 @@ int rc_map(struct dm_target *ti, struct bio *bio)
 
 	if (to_sector(bio->bi_iter.bi_size) != dmc->block_size ||
 	    (dmc->mode && (bio_data_dir(bio) == WRITE))) {
-
 		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 		(void)cache_invalidate_blocks(dmc, bio);
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
@@ -737,6 +753,7 @@ static void rc_uncached_io_callback(unsigned long error, void *context)
 static void rc_start_uncached_io(struct cache_context *dmc, struct bio *bio)
 {
 	struct kcached_job *job;
+	int is_write = (bio_data_dir(bio) == WRITE);
 
 	job = new_kcached_job(dmc, bio, -1);
 	if (unlikely(!job)) {
@@ -749,7 +766,7 @@ static void rc_start_uncached_io(struct cache_context *dmc, struct bio *bio)
 		dmc->disk_reads++;
 	else
 		dmc->disk_writes++;
-	dm_io_async_bvec(&job->disk, bio, rc_uncached_io_callback, job);
+	dm_io_async_bvec(&job->disk, ((is_write) ? WRITE : READ), bio, rc_uncached_io_callback, job);
 }
 
 static inline int rc_get_dev(struct dm_target *ti, char *pth,
