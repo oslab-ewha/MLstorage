@@ -99,10 +99,9 @@ struct cache_context {
 	struct cache_block *cache;
 	u8 *cache_state;
 	u32 *set_lru_next;
-	int mode;			/* Write Through / Around */
 
 	struct dm_io_client *io_client;
-	sector_t size;
+	sector_t size, size_nominal;
 	unsigned int assoc;
 	unsigned int block_size;
 	unsigned int block_shift;
@@ -160,7 +159,7 @@ static int cache_invalidate_blocks(struct cache_context *, struct bio *);
 static void rc_uncached_io_callback(unsigned long, void *);
 static void rc_start_uncached_io(struct cache_context *, struct bio *);
 
-int rdsk_submit_bio(bool is_write, struct gendisk *disk, sector_t sector, struct bio *bio);
+int stolearn_nn_submit(bool is_write, struct gendisk *disk, sector_t sector, struct bio *bio);
 static void rc_io_callback(unsigned long error, void *context);
 
 static void
@@ -321,7 +320,7 @@ do_io(struct kcached_job *job)
 	ASSERT(job->rw == WRITECACHE);
 	dmc->cache_writes++;
 
-	err = rdsk_submit_bio(true, dmc->cache_dev->bdev->bd_disk, job->cache.sector, bio);
+	err = stolearn_nn_submit(true, dmc->cache_dev->bdev->bd_disk, job->cache.sector, bio);
 	rc_io_callback(err, job);
 
 	return 0;
@@ -562,7 +561,7 @@ cache_read(struct cache_context *dmc, struct bio *bio)
 			job->rw = READCACHE;
 			atomic_inc(&dmc->nr_jobs);
 			dmc->cache_reads++;
-			err = rdsk_submit_bio(false, dmc->cache_dev->bdev->bd_disk, job->cache.sector, bio);
+			err = stolearn_nn_submit(false, dmc->cache_dev->bdev->bd_disk, job->cache.sector, bio);
 			rc_io_callback(err, job);
 		}
 		return;
@@ -710,8 +709,7 @@ rc_map(struct dm_target *ti, struct bio *bio)
 	else
 		dmc->writes++;
 
-	if (to_sector(bio->bi_iter.bi_size) != dmc->block_size ||
-	    (dmc->mode && (bio_data_dir(bio) == WRITE))) {
+	if (to_sector(bio->bi_iter.bi_size) != dmc->block_size) {
 		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 		(void)cache_invalidate_blocks(dmc, bio);
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
@@ -785,8 +783,7 @@ static inline int rc_get_dev(struct dm_target *ti, char *pth,
  *  arg[0]: path to source device
  *  arg[1]: path to cache device
  *  arg[2]: size in MB
- *  arg[3]: mode: write through / around
- *  arg[4]: cache associativity */
+ *  arg[3]: cache associativity */
 static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct cache_context *dmc;
@@ -841,7 +838,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	dmc->block_shift = ffs(dmc->block_size) - 1;
 	dmc->block_mask = dmc->block_size - 1;
 
-	dmc->size = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
+	dmc->size_nominal = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
 
 	if (argc >= 3) {
 		unsigned int	size_in_MB;
@@ -851,22 +848,14 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			r = -EINVAL;
 			goto construct_fail5;
 		}
-
 		dmc->size = to_sector(size_in_MB * 1024 * 1024);
+	}
+	else {
+		dmc->size = dmc->size_nominal;
 	}
 
 	if (argc >= 4) {
-		if (sscanf(argv[3], "%d", &dmc->mode) != 1) {
-			ti->error = "stolearn-cache: Invalid mode";
-			r = -EINVAL;
-			goto construct_fail5;
-                }
-	} else {
-		dmc->mode = WRITETHROUGH;
-	}
-
-	if (argc >= 5) {
-		if (kstrtoint(argv[4], 10, &dmc->assoc)) {
+		if (kstrtoint(argv[3], 10, &dmc->assoc)) {
 			ti->error = "stolearn-cache: Invalid cache associativity";
 			r = -EINVAL;
 			goto construct_fail5;
@@ -888,25 +877,30 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	do_div(tmpsize, dmc->assoc);
 	dmc->size = tmpsize * dmc->assoc;
 
+	do_div(dmc->size_nominal, dmc->block_size);
+	tmpsize = dmc->size_nominal;
+	do_div(tmpsize, dmc->assoc);
+	dmc->size_nominal = tmpsize * dmc->assoc;
+
 	dev_size = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
 	data_size = dmc->size * dmc->block_size;
 	if (data_size > dev_size) {
+#if 0
 		DMINFO("Requested cache size exceeds the cache device's capacity (%lu>%lu)",
 		       (unsigned long)data_size, (unsigned long)dev_size);
+#endif
 	}
 
 	consecutive_blocks = dmc->assoc;
 	dmc->consecutive_shift = ffs(consecutive_blocks) - 1;
 
 	order = dmc->size * sizeof(struct cache_block);
-	DMINFO("Allocate %luKB (%luB per) mem for %lu-entry cache"
-		"(capacity:%luMB, associativity:%u, block size:%u sectors(%uKB))",
-		(unsigned long)order >> 10,
-		(unsigned long)sizeof(struct cache_block),
-		(unsigned long)dmc->size,
-		(unsigned long)data_size >> (20 - SECTOR_SHIFT),
-		dmc->assoc, dmc->block_size,
-		dmc->block_size >> (10 - SECTOR_SHIFT));
+	DMINFO("allocate %lu-entry cache"
+	       "(capacity:%luMB, associativity:%u, block size:%u sectors(%uKB))",
+	       (unsigned long)((dmc->size_nominal * sizeof(struct cache_block)) >> 10),
+	       (unsigned long)(dmc->size_nominal * dmc->block_size / 2),
+	       dmc->assoc, dmc->block_size,
+	       dmc->block_size >> (10 - SECTOR_SHIFT));
 	dmc->cache = vmalloc(order);
 	if (!dmc->cache)
 		goto construct_fail6;
@@ -981,10 +975,10 @@ static void cache_dtr(struct dm_target *ti)
 			dmc->cache_hits, dmc->replace, dmc->cache_wr_replace,
 			dmc->rd_invalidates, dmc->wr_invalidates);
 		DMINFO("conf:\n\tcapacity(%luM), associativity(%u), block size(%uK)\n"
-			"\ttotal blocks(%lu), cached blocks(%lu)\n",
-			(unsigned long)dmc->size * dmc->block_size >> 11,
-			dmc->assoc, dmc->block_size >> (10 - SECTOR_SHIFT),
-			(unsigned long)dmc->size, dmc->cached_blocks);
+		       "\ttotal blocks(%lu)\n",
+		       (unsigned long)dmc->size_nominal * dmc->block_size >> 11,
+		       dmc->assoc, dmc->block_size >> (10 - SECTOR_SHIFT),
+		       (unsigned long)dmc->size_nominal);
 	}
 
 	dm_io_client_destroy(dmc->io_client);
@@ -1020,14 +1014,13 @@ static void rc_status_table(struct cache_context *dmc, status_type_t type,
 {
 	int sz = 0;
 
-	DMEMIT("conf:\n\tStolearn-NN dev (%s), disk dev (%s) mode (%s)\n"
-		"\tcapacity(%luM), associativity(%u), block size(%uK)\n"
-		"\ttotal blocks(%lu), cached blocks(%lu)\n",
-		dmc->cache_devname, dmc->disk_devname,
-		((dmc->mode) ? "WRITE_AROUND" : "WRITETHROUGH"),
-		(unsigned long)dmc->size * dmc->block_size >> 11, dmc->assoc,
-		dmc->block_size >> (10 - SECTOR_SHIFT),
-		(unsigned long)dmc->size, dmc->cached_blocks);
+	DMEMIT("conf:\n\tStolearn-NN dev (%s), disk dev (%s)"
+	       "\tcapacity(%luM), associativity(%u), block size(%uK)\n"
+	       "\ttotal blocks(%lu)\n",
+	       dmc->cache_devname, dmc->disk_devname,
+	       (unsigned long)dmc->size_nominal * dmc->block_size >> 11, dmc->assoc,
+	       dmc->block_size >> (10 - SECTOR_SHIFT),
+	       (unsigned long)dmc->size_nominal);
 }
 
 static void
@@ -1048,7 +1041,7 @@ cache_status(struct dm_target *ti, status_type_t type, unsigned status_flags,
 
 static struct target_type cache_target = {
 	.name    = "stolearn-cache",
-	.version = {1, 1, 0},
+	.version = {1, 0, 0},
 	.module  = THIS_MODULE,
 	.ctr	 = cache_ctr,
 	.dtr	 = cache_dtr,
@@ -1091,3 +1084,4 @@ MODULE_AUTHOR("oslab <oslab@oslab.ewha.ac.kr>");
 MODULE_DESCRIPTION("Stolearn-Cache is a machine learning based caching target with NN model.");
 MODULE_VERSION(VERSION_STR);
 MODULE_INFO(Copyright, "Copyleft 2021 OSLAB, Ewha");
+MODULE_SOFTDEP("pre: stolearn_nn");

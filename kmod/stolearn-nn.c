@@ -72,12 +72,10 @@ static int max_sectors = DEFAULT_MAX_SECTS, nr_requests = DEFAULT_REQUESTS;
 static LIST_HEAD(rdsk_devices);
 static struct kobject *rdsk_kobj;
 
-module_param(max_sectors, int, S_IRUGO);
-MODULE_PARM_DESC(max_sectors, " max sectors (in KB) for the request queue. (Default = 127)");
 module_param(nr_requests, int, S_IRUGO);
 MODULE_PARM_DESC(nr_requests, " # of requests at a given time for the request queue. (Default = 128)");
 module_param(rd_max_nr, int, S_IRUGO);
-MODULE_PARM_DESC(rd_max_nr, " max number of RAM Disks. (Default = 128)");
+MODULE_PARM_DESC(rd_max_nr, " max number of neural networks. (Default = 128)");
 
 static int rdsk_do_bvec(struct rdsk_device *, struct page *,
 			unsigned int, unsigned int, bool, sector_t);
@@ -96,10 +94,10 @@ static ssize_t mgmt_show(struct kobject *kobj, struct kobj_attribute *attr,
 	int len;
 	struct rdsk_device *rdsk;
 
-	len = sprintf(buf, "Stolearn-NN %s\n\nMaximum Number of Attachable Devices: %d\nNumber of Attached Devices: %d\nMax Sectors (KB): %d\nNumber of Requests: %d\n\n",
-		      VERSION_STR, rd_max_nr, rd_total, max_sectors, nr_requests);
+	len = sprintf(buf, "Stolearn-NN %s\n\nMaximum Number of Neural Networks: %d\nNumber of Neural Networks: %d\nNumber of Requests: %d\n\n",
+		      VERSION_STR, rd_max_nr, rd_total, nr_requests);
 	list_for_each_entry(rdsk, &rdsk_devices, rdsk_list) {
-		len += sprintf(buf + len, "stolearn-nn%d\tSize: %llu MBs\tErrors: %lu\n",
+		len += sprintf(buf + len, "stolearn-nn%d\tNeural Network Size: %llu MBs\tErrors: %lu\n",
 			       rdsk->num, (rdsk->size / 1024 / 1024),
 			       rdsk->error_cnt);
 	}
@@ -406,7 +404,7 @@ out:
 }
 
 int
-rdsk_submit_bio(bool is_write, struct gendisk *disk, sector_t sector, struct bio *bio)
+stolearn_nn_submit(bool is_write, struct gendisk *disk, sector_t sector, struct bio *bio)
 {
 	struct rdsk_device *rdsk = disk->private_data;
 	struct bio_vec bvec;
@@ -434,7 +432,7 @@ rdsk_submit_bio(bool is_write, struct gendisk *disk, sector_t sector, struct bio
 	}
 	return 0;
 }
-EXPORT_SYMBOL(rdsk_submit_bio);
+EXPORT_SYMBOL(stolearn_nn_submit);
 
 static blk_qc_t
 rdsk_make_request(struct request_queue *q, struct bio *bio)
