@@ -27,7 +27,9 @@ MKDIR := mkdir -pv
 CP := cp -v
 
 obj-m += stolearn-nn.o
-obj-m += stolearn-cache.o
+obj-m += mlstor.o
+
+mlstor-y := stolearn-cache.o pcache.o
 
 # for kernel debug
 # EXTRA_CFLAGS += -g

@@ -45,6 +45,9 @@
 #include <linux/hardirq.h>
 #include <linux/dm-io.h>
 #include <linux/device-mapper.h>
+#include <linux/mm.h>
+
+#include "pcache.h"
 
 #define ASSERT(x) do { \
 	if (unlikely(!(x))) { \
@@ -94,6 +97,7 @@ struct cache_context {
 	struct dm_target *tgt;
 	struct dm_dev *disk_dev;	/* Source device */
 	struct dm_dev *cache_dev;	/* Cache device */
+	pcache_t	*pcache;
 
 	spinlock_t cache_spin_lock;
 	struct cache_block *cache;
@@ -159,7 +163,6 @@ static int cache_invalidate_blocks(struct cache_context *, struct bio *);
 static void rc_uncached_io_callback(unsigned long, void *);
 static void rc_start_uncached_io(struct cache_context *, struct bio *);
 
-int stolearn_nn_submit(bool is_write, struct gendisk *disk, sector_t sector, struct bio *bio);
 static void rc_io_callback(unsigned long error, void *context);
 
 static void
@@ -320,7 +323,7 @@ do_io(struct kcached_job *job)
 	ASSERT(job->rw == WRITECACHE);
 	dmc->cache_writes++;
 
-	err = stolearn_nn_submit(true, dmc->cache_dev->bdev->bd_disk, job->cache.sector, bio);
+	err = pcache_submit(dmc->pcache, true, job->cache.sector, bio);
 	rc_io_callback(err, job);
 
 	return 0;
@@ -561,7 +564,7 @@ cache_read(struct cache_context *dmc, struct bio *bio)
 			job->rw = READCACHE;
 			atomic_inc(&dmc->nr_jobs);
 			dmc->cache_reads++;
-			err = stolearn_nn_submit(false, dmc->cache_dev->bdev->bd_disk, job->cache.sector, bio);
+			err = pcache_submit(dmc->pcache, false, job->cache.sector, bio);
 			rc_io_callback(err, job);
 		}
 		return;
@@ -779,16 +782,26 @@ static inline int rc_get_dev(struct dm_target *ti, char *pth,
 	return rc;
 }
 
+static unsigned long
+get_max_sectors_by_mem(void)
+{
+	struct sysinfo	si;
+
+	si_meminfo(&si);
+	return (si.totalram * PAGE_SIZE / SECTOR_SIZE / 4);
+}
+
 /* Construct a cache mapping.
  *  arg[0]: path to source device
  *  arg[1]: path to cache device
- *  arg[2]: size in MB
+ *  arg[2]: pcache size in MB
  *  arg[3]: cache associativity */
 static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct cache_context *dmc;
 	unsigned int consecutive_blocks;
 	sector_t i, order, tmpsize;
+	sector_t max_sectors_bymem;
 	sector_t data_size, dev_size;
 	int r = -EINVAL;
 
@@ -810,12 +823,6 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	    dmc->disk_devname, ti->len)) {
 		ti->error = "stolearn-cache: Disk device lookup failed";
 		goto construct_fail1;
-	}
-	if (strncmp(argv[1], "/dev/stolearn-nn", 16) != 0) {
-		pr_err("%s: %s is not a valid cache device for stolearn-cache.",
-		       DM_MSG_PREFIX, argv[1]);
-		ti->error = "stolearn-cache: invalid cache device. Not a stolearn-nn.";
-		goto construct_fail2;
 	}
 	if (rc_get_dev(ti, argv[1], &dmc->cache_dev, dmc->cache_devname, 0)) {
 		ti->error = "stolearn-cache: Cache device lookup failed";
@@ -839,9 +846,12 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	dmc->block_mask = dmc->block_size - 1;
 
 	dmc->size_nominal = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
-
+	dmc->size = dmc->size_nominal;
+	max_sectors_bymem = get_max_sectors_by_mem();
+	if (dmc->size > max_sectors_bymem)
+		dmc->size = max_sectors_bymem;
 	if (argc >= 3) {
-		unsigned int	size_in_MB;
+		unsigned int    size_in_MB;
 
 		if (kstrtouint(argv[2], 0, &size_in_MB)) {
 			ti->error = "stolearn-cache: invalid size format";
@@ -849,9 +859,6 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			goto construct_fail5;
 		}
 		dmc->size = to_sector(size_in_MB * 1024 * 1024);
-	}
-	else {
-		dmc->size = dmc->size_nominal;
 	}
 
 	if (argc >= 4) {
@@ -938,6 +945,8 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto construct_fail8;
 	ti->private = dmc;
 
+	dmc->pcache = pcache_create();
+
 	return 0;
 
 construct_fail8:
@@ -980,6 +989,8 @@ static void cache_dtr(struct dm_target *ti)
 		       dmc->assoc, dmc->block_size >> (10 - SECTOR_SHIFT),
 		       (unsigned long)dmc->size_nominal);
 	}
+
+	pcache_delete(dmc->pcache);
 
 	dm_io_client_destroy(dmc->io_client);
 	vfree(dmc->cache);
