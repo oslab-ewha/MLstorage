@@ -146,18 +146,15 @@ struct kcached_job {
 	struct bio *bio;	/* Original bio */
 	struct dm_io_region disk;
 	struct dm_io_region cache;
+	struct work_struct	work;
 	int index;
 	int rw;
 	int error;
 };
 
 static struct workqueue_struct *kcached_wq;
-static struct work_struct kcached_work;
 static struct kmem_cache *job_cache;
 static mempool_t *job_pool;
-static DEFINE_SPINLOCK(job_lock);
-static LIST_HEAD(complete_jobs);
-static LIST_HEAD(io_jobs);
 
 static void rc_start_uncached_io(struct cache_context *, struct bio *);
 
@@ -198,36 +195,10 @@ static int jobs_init(void)
 
 static void jobs_exit(void)
 {
-	BUG_ON(!list_empty(&complete_jobs));
-	BUG_ON(!list_empty(&io_jobs));
-
 	mempool_destroy(job_pool);
 	kmem_cache_destroy(job_cache);
 	job_pool = NULL;
 	job_cache = NULL;
-}
-
-static inline struct kcached_job *pop(struct list_head *jobs)
-{
-	struct kcached_job *job = NULL;
-	unsigned long flags;
-
-	spin_lock_irqsave(&job_lock, flags);
-	if (!list_empty(jobs)) {
-		job = list_entry(jobs->next, struct kcached_job, list);
-		list_del(&job->list);
-	}
-	spin_unlock_irqrestore(&job_lock, flags);
-	return job;
-}
-
-static inline void push(struct list_head *jobs, struct kcached_job *job)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&job_lock, flags);
-	list_add_tail(&job->list, jobs);
-	spin_unlock_irqrestore(&job_lock, flags);
 }
 
 static void
@@ -265,8 +236,7 @@ rc_io_callback(unsigned long error, void *context)
 			goto out;
 		} else {
 			job->rw = WRITECACHE;
-			push(&io_jobs, job);
-			queue_work(kcached_wq, &kcached_work);
+			queue_work(kcached_wq, &job->work);
 			return;
 		}
 	} else if (job->rw == READCACHE) {
@@ -285,8 +255,7 @@ rc_io_callback(unsigned long error, void *context)
 		}
 		/* error || invalid || bounce back to source device */
 		job->rw = READCACHE_DONE;
-		push(&complete_jobs, job);
-		queue_work(kcached_wq, &kcached_work);
+		queue_work(kcached_wq, &job->work);
 		return;
 	} else {
 		ASSERT(job->rw == WRITECACHE);
@@ -344,19 +313,22 @@ rc_do_complete(struct kcached_job *job)
 	return 0;
 }
 
-static void process_jobs(struct list_head *jobs,
-			 int (*fn)(struct kcached_job *))
+static void
+do_work(struct work_struct *work)
 {
-	struct kcached_job *job;
+	struct kcached_job	*job = container_of(work, struct kcached_job, work);
 
-	while ((job = pop(jobs)))
-		(void)fn(job);
-}
-
-static void do_work(struct work_struct *work)
-{
-	process_jobs(&complete_jobs, rc_do_complete);
-	process_jobs(&io_jobs, do_io);
+	switch (job->rw) {
+	case WRITECACHE:
+		do_io(job);
+		break;
+	case READCACHE_DONE:
+		rc_do_complete(job);
+		break;
+	default:
+		ASSERT(0);
+		break;
+	}
 }
 
 static int kcached_init(struct cache_context *dmc)
@@ -502,6 +474,7 @@ static struct kcached_job *new_kcached_job(struct cache_context *dmc,
 	job->bio = bio;
 	job->index = index;
 	job->error = 0;
+	INIT_WORK(&job->work, do_work);
 	return job;
 }
 
@@ -1066,8 +1039,6 @@ int __init rc_init(void)
 	kcached_wq = create_singlethread_workqueue("kcached");
 	if (!kcached_wq)
 		return -ENOMEM;
-
-	INIT_WORK(&kcached_work, do_work);
 
 	ret = dm_register_target(&cache_target);
 	if (ret < 0)
