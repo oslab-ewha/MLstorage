@@ -74,11 +74,10 @@
 #define INVALID		0
 #define VALID		1
 #define INPROG		2	/* IO (cache fill) is in progress */
-#define COPYING		3
-#define INPROG_INVALID	4	/* Write invalidated during a refill */
+#define INPROG_INVALID	3	/* Write invalidated during a refill */
 
 #define IS_VALID_CACHE_STATE(s)	((s) == VALID)
-#define IS_VALID_OR_PROG_CACHE_STATE(s)	(IS_VALID_CACHE_STATE(s) || (s) == INPROG || (s) == COPYING)
+#define IS_VALID_OR_PROG_CACHE_STATE(s)	(IS_VALID_CACHE_STATE(s) || (s) == INPROG)
 #define IS_INPROG_CACHE_STATE(s)	((s) >= INPROG)
 
 #define DEV_PATHLEN	128
@@ -94,7 +93,8 @@
 #pragma pack(push, 1)
 typedef struct _cacheinfo {
 	sector_t dbn;		/* Sector number of the cached block */
-	u8	state;
+	u16	n_readers;
+	u16	state:4;
 } cacheinfo_t;
 #pragma pack(pop)
 
@@ -445,10 +445,11 @@ cache_invalidate_block_set(struct cache_context *dmc, int set, sector_t io_start
 	start_index = dmc->assoc * set;
 	end_index = start_index + dmc->assoc;
 	for (i = start_index; i < end_index; i++) {
-		sector_t start_dbn = dmc->cacheinfos[i].dbn;
+		cacheinfo_t	*ci = dmc->cacheinfos + i;
+		sector_t start_dbn = ci->dbn;
 		sector_t end_dbn = start_dbn + dmc->block_size;
 
-		if (dmc->cacheinfos[i].state == INVALID || dmc->cacheinfos[i].state == INPROG_INVALID)
+		if (ci->state == INVALID || ci->state == INPROG_INVALID)
 			continue;
 		if ((io_start >= start_dbn && io_start < end_dbn) ||
 		    (io_end >= start_dbn && io_end < end_dbn)) {
@@ -456,10 +457,10 @@ cache_invalidate_block_set(struct cache_context *dmc, int set, sector_t io_start
 				dmc->wr_invalidates++;
 			else
 				dmc->rd_invalidates++;
-			if (IS_VALID_CACHE_STATE(dmc->cacheinfos[i].state)) {
+			if (IS_VALID_CACHE_STATE(ci->state) && ci->n_readers == 0) {
 				dmc->cached_blocks--;
 				dmc->cacheinfos[i].state = INVALID;
-			} else if (IS_INPROG_CACHE_STATE(dmc->cacheinfos[i].state)) {
+			} else {
 				invalidated = false;
 				dmc->cacheinfos[i].state = INPROG_INVALID;
 				DMERR("%s: sector %lu, size %lu, rw %d",
@@ -494,7 +495,7 @@ static void
 copy_pcache_to_bio(struct cache_context *dmc, struct bio *bio, int index)
 {
 	sector_t	sector = index << dmc->block_shift;
-	bool	invalid = false;
+	cacheinfo_t	*ci = dmc->cacheinfos + index;
 	unsigned long	flags;
 	int	err;
 
@@ -503,26 +504,21 @@ copy_pcache_to_bio(struct cache_context *dmc, struct bio *bio, int index)
 
 	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 
-	ASSERT(dmc->cacheinfos[index].state == INPROG_INVALID || dmc->cacheinfos[index].state == COPYING);
-
-	if (dmc->cacheinfos[index].state == INPROG_INVALID)
-		invalid = true;
-
-	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-
-	if (!invalid && err == 0) {
-		bio_endio(bio);
-		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-		dmc->cacheinfos[index].state = VALID;
+	ASSERT(ci->state == INPROG_INVALID || ci->state == VALID);
+	ASSERT(ci->n_readers > 0);
+	ci->n_readers--;
+	if (ci->state == INPROG_INVALID && ci->n_readers == 0) {
+		ci->state = INVALID;
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+		rc_start_uncached_io(dmc, bio);
+	}
+	else if (err != 0) {
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+		rc_start_uncached_io(dmc, bio);
 	}
 	else {
-		/* error || block invalidated while reading from cache */
-		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-		dmc->cacheinfos[index].state = INVALID;
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-
-		rc_start_uncached_io(dmc, bio);
+		bio_endio(bio);
 	}
 }
 
@@ -552,8 +548,7 @@ cache_read(struct cache_context *dmc, struct bio *bio)
 
 	res = cache_lookup(dmc, bio, &index);
 	if (IS_VALID_CACHE_STATE(res) && dmc->cacheinfos[index].dbn == bio->bi_iter.bi_sector) {
-		dmc->cacheinfos[index].state = COPYING;
-
+		dmc->cacheinfos[index].n_readers++;
 		dmc->cache_hits++;
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
 
@@ -847,6 +842,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	for (i = 0; i < dmc->size ; i++) {
 		dmc->cacheinfos[i].dbn = 0;
+		dmc->cacheinfos[i].n_readers = 0;
 		dmc->cacheinfos[i].state = INVALID;
 	}
 
