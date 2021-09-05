@@ -74,11 +74,9 @@
 #define INVALID		0
 #define VALID		1
 #define INPROG		2	/* IO (cache fill) is in progress */
-#define INPROG_INVALID	3	/* Write invalidated during a refill */
 
 #define IS_VALID_CACHE_STATE(s)	((s) == VALID)
 #define IS_VALID_OR_PROG_CACHE_STATE(s)	(IS_VALID_CACHE_STATE(s) || (s) == INPROG)
-#define IS_INPROG_CACHE_STATE(s)	((s) >= INPROG)
 
 #define DEV_PATHLEN	128
 
@@ -94,7 +92,8 @@
 typedef struct _cacheinfo {
 	sector_t dbn;		/* Sector number of the cached block */
 	u16	n_readers;
-	u16	state:4;
+	int	state:15;
+	bool	invalidated:1;
 } cacheinfo_t;
 #pragma pack(pop)
 
@@ -212,6 +211,7 @@ job_free(struct kcached_job *job)
 static void
 copy_bio_to_pcache(struct cache_context *dmc, struct bio *bio, int index)
 {
+	cacheinfo_t	*ci = dmc->cacheinfos + index;
 	sector_t	sector = index << dmc->block_shift;
 	unsigned long flags;
 	int	err;
@@ -223,11 +223,12 @@ copy_bio_to_pcache(struct cache_context *dmc, struct bio *bio, int index)
 	bio_endio(bio);
 
 	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-	ASSERT((dmc->cacheinfos[index].state == INPROG) || (dmc->cacheinfos[index].state == INPROG_INVALID));
-	if (err || dmc->cacheinfos[index].state == INPROG_INVALID) {
-		dmc->cacheinfos[index].state = INVALID;
+	ASSERT(ci->state == INPROG);
+	if (err || ci->invalidated) {
+		ci->state = INVALID;
+		ci->invalidated = false;
 	} else {
-		dmc->cacheinfos[index].state = VALID;
+		ci->state = VALID;
 		dmc->cached_blocks++;
 	}
 	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
@@ -239,31 +240,29 @@ rc_io_callback(unsigned long err, void *context)
 	struct kcached_job	*job = (struct kcached_job *)context;
 	struct cache_context	*dmc = job->dmc;
 	int	index = job->index;
+	cacheinfo_t	*ci = dmc->cacheinfos + index;
 	struct bio	*bio;
 	unsigned long	flags;
-	bool	invalid = false;
 
 	bio = job->bio;
 	if (err)
 		DMERR("%s: io error %ld", __func__, err);
 
 	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-	if (dmc->cacheinfos[index].state != INPROG) {
-		ASSERT(dmc->cacheinfos[index].state == INPROG_INVALID);
-		invalid = true;
-	}
-	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-	if (err || invalid) {
-		if (invalid)
-			DMERR("%s: cache fill invalidation, sector %lu, size %u",
-			      __func__, (unsigned long)bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
+
+	ASSERT(ci->state == INPROG);
+	if (err || ci->invalidated) {
+		ci->state = INVALID;
+		ci->invalidated = false;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+
 		bio->bi_status= err;
 		bio_io_error(bio);
-		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-		dmc->cacheinfos[index].state = INVALID;
-		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+
 		job_free(job);
-	} else {
+	}
+	else {
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
 		job_free(job);
 		copy_bio_to_pcache(dmc, bio, index);
 	}
@@ -295,16 +294,16 @@ hash_block(struct cache_context *dmc, sector_t dbn)
 }
 
 static int
-find_valid_dbn(struct cache_context *dmc, sector_t dbn, int start_index, int *index)
+find_valid_dbn(struct cache_context *dmc, sector_t dbn, int start_index, int *pindex)
 {
+	cacheinfo_t	*ci;
 	int	end_index = start_index + dmc->assoc;
 	int	i;
 
-	for (i = start_index; i < end_index; i++) {
-		if (dbn == dmc->cacheinfos[i].dbn &&
-		    IS_VALID_OR_PROG_CACHE_STATE(dmc->cacheinfos[i].state)) {
-			*index = i;
-			return dmc->cacheinfos[i].state;
+	for (i = start_index, ci = dmc->cacheinfos + start_index; i < end_index; i++, ci++) {
+		if (dbn == ci->dbn && IS_VALID_OR_PROG_CACHE_STATE(ci->state)) {
+			*pindex = i;
+			return ci->state;
 		}
 	}
 	return GENERIC_ERROR;
@@ -359,7 +358,7 @@ find_reclaim_dbn(struct cache_context *dmc, int start_index, int *pindex_reclaim
 
 /* dbn is the starting sector, io_size is the number of sectors. */
 static int
-cache_lookup(struct cache_context *dmc, struct bio *bio, int *index)
+cache_lookup(struct cache_context *dmc, struct bio *bio, int *pindex)
 {
 	sector_t dbn = bio->bi_iter.bi_sector;
 	unsigned long	set_number = hash_block(dmc, dbn);
@@ -368,14 +367,14 @@ cache_lookup(struct cache_context *dmc, struct bio *bio, int *index)
 	int	ret;
 
 	start_index = dmc->assoc * set_number;
-	ret = find_valid_dbn(dmc, dbn, start_index, index);
-	if (IS_VALID_OR_PROG_CACHE_STATE(ret)) {
+	ret = find_valid_dbn(dmc, dbn, start_index, pindex);
+	if (ret != GENERIC_ERROR) {
 		/* We found the exact range of blocks we are looking for */
 		return ret;
 	}
-	ASSERT(ret == GENERIC_ERROR);
+
 	if (find_invalid_dbn(dmc, start_index, &index_invalid)) {
-		*index = index_invalid;
+		*pindex = index_invalid;
 	}
 	else {
 		int	index_reclaimed;
@@ -383,7 +382,7 @@ cache_lookup(struct cache_context *dmc, struct bio *bio, int *index)
 		/* We didn't find an invalid entry, search for oldest valid entry */
 		if (!find_reclaim_dbn(dmc, start_index, &index_reclaimed))
 			return GENERIC_ERROR;
-		*index = index_reclaimed;
+		*pindex = index_reclaimed;
 	}
 
 	return INVALID;
@@ -449,7 +448,7 @@ cache_invalidate_block_set(struct cache_context *dmc, int set, sector_t io_start
 		sector_t start_dbn = ci->dbn;
 		sector_t end_dbn = start_dbn + dmc->block_size;
 
-		if (ci->state == INVALID || ci->state == INPROG_INVALID)
+		if (ci->state == INVALID)
 			continue;
 		if ((io_start >= start_dbn && io_start < end_dbn) ||
 		    (io_end >= start_dbn && io_end < end_dbn)) {
@@ -457,12 +456,12 @@ cache_invalidate_block_set(struct cache_context *dmc, int set, sector_t io_start
 				dmc->wr_invalidates++;
 			else
 				dmc->rd_invalidates++;
-			if (IS_VALID_CACHE_STATE(ci->state) && ci->n_readers == 0) {
+			if (IS_VALID_CACHE_STATE(ci->state) && ci->n_readers == 0 && !ci->invalidated) {
 				dmc->cached_blocks--;
-				dmc->cacheinfos[i].state = INVALID;
+				ci->state = INVALID;
 			} else {
 				invalidated = false;
-				dmc->cacheinfos[i].state = INPROG_INVALID;
+				ci->invalidated = true;
 				DMERR("%s: sector %lu, size %lu, rw %d",
 				      __func__, (unsigned long)io_start,
 				      (unsigned long)io_end - (unsigned long)io_start, rw);
@@ -504,11 +503,12 @@ copy_pcache_to_bio(struct cache_context *dmc, struct bio *bio, int index)
 
 	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 
-	ASSERT(ci->state == INPROG_INVALID || ci->state == VALID);
+	ASSERT(ci->state == VALID);
 	ASSERT(ci->n_readers > 0);
 	ci->n_readers--;
-	if (ci->state == INPROG_INVALID && ci->n_readers == 0) {
+	if (ci->invalidated && ci->n_readers == 0) {
 		ci->state = INVALID;
+		ci->invalidated = false;
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
 		rc_start_uncached_io(dmc, bio);
 	}
@@ -540,6 +540,7 @@ cache_read_miss(struct cache_context *dmc, struct bio *bio, int index)
 static void
 cache_read(struct cache_context *dmc, struct bio *bio)
 {
+	cacheinfo_t	*ci;
 	int	index;
 	int	res;
 	unsigned long	flags;
@@ -556,7 +557,7 @@ cache_read(struct cache_context *dmc, struct bio *bio)
 		return;
 	}
 
-	if (!cache_invalidate_blocks(dmc, bio) || res == GENERIC_ERROR || IS_INPROG_CACHE_STATE(res)) {
+	if (!cache_invalidate_blocks(dmc, bio)) {
 		/* A false return indicates an inprog invalidation */
 
 		/* Or we either didn't find a cache slot in the set we were
@@ -568,14 +569,17 @@ cache_read(struct cache_context *dmc, struct bio *bio)
 		return;
 	}
 
+	ci = dmc->cacheinfos + index;
+
 	/* (res == INVALID) Cache Miss And we found cache blocks to replace
 	 * Claim the cache blocks before giving up the spinlock */
-	if (IS_VALID_CACHE_STATE(dmc->cacheinfos[index].state)) {
+	if (IS_VALID_CACHE_STATE(ci->state)) {
 		dmc->cached_blocks--;
 		dmc->replace++;
 	}
-	dmc->cacheinfos[index].state = INPROG;
-	dmc->cacheinfos[index].dbn = bio->bi_iter.bi_sector;
+
+	ci->state = INPROG;
+	ci->dbn = bio->bi_iter.bi_sector;
 
 	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
 
@@ -586,6 +590,7 @@ static void
 cache_write(struct cache_context *dmc, struct bio *bio)
 {
 	struct kcached_job	*job;
+	cacheinfo_t	*ci;
 	int	index;
 	int	res;
 	unsigned long	flags;
@@ -608,8 +613,10 @@ cache_write(struct cache_context *dmc, struct bio *bio)
 		dmc->cached_blocks--;
 		dmc->cache_wr_replace++;
 	}
-	dmc->cacheinfos[index].state = INPROG;
-	dmc->cacheinfos[index].dbn = bio->bi_iter.bi_sector;
+
+	ci = dmc->cacheinfos + index;
+	ci->state = INPROG;
+	ci->dbn = bio->bi_iter.bi_sector;
 	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
 
 	job = alloc_kcached_job(dmc, bio, index);
@@ -728,7 +735,6 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	unsigned int consecutive_blocks;
 	sector_t i, order, tmpsize;
 	sector_t max_sectors_bymem;
-	sector_t data_size, dev_size;
 	int r = -EINVAL;
 
 	if (argc < 2) {
@@ -815,15 +821,6 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	do_div(tmpsize, dmc->assoc);
 	dmc->size_nominal = tmpsize * dmc->assoc;
 
-	dev_size = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
-	data_size = dmc->size * dmc->block_size;
-	if (data_size > dev_size) {
-#if 0
-		DMINFO("Requested cache size exceeds the cache device's capacity (%lu>%lu)",
-		       (unsigned long)data_size, (unsigned long)dev_size);
-#endif
-	}
-
 	consecutive_blocks = dmc->assoc;
 	dmc->consecutive_shift = ffs(consecutive_blocks) - 1;
 
@@ -840,10 +837,11 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (!dmc->set_lru_next)
 		goto construct_fail7;
 
-	for (i = 0; i < dmc->size ; i++) {
+	for (i = 0; i < dmc->size; i++) {
 		dmc->cacheinfos[i].dbn = 0;
 		dmc->cacheinfos[i].n_readers = 0;
 		dmc->cacheinfos[i].state = INVALID;
+		dmc->cacheinfos[i].invalidated = false;
 	}
 
 	/* Initialize the point where LRU sweeps begin for each set */
