@@ -88,9 +88,6 @@
 
 #define WT_MIN_JOBS	1024
 /* Number of pages for I/O */
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,39)
-#define COPY_PAGES (1024)
-#endif
 
 /* Cache context */
 struct cache_context {
@@ -164,29 +161,16 @@ static void rc_uncached_io_callback(unsigned long, void *);
 static void rc_start_uncached_io(struct cache_context *, struct bio *);
 
 int dm_io_async_bvec(unsigned int num_regions, struct dm_io_region *where,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 		     int rw, struct bio *bio, io_notify_fn fn, void *context)
-#else
-		     int rw, struct bio_vec *bvec, io_notify_fn fn, void *context)
-#endif
 {
 	struct kcached_job *job = (struct kcached_job *)context;
 	struct cache_context *dmc = job->dmc;
 	struct dm_io_request iorq;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
 	iorq.bi_op = rw;
 	iorq.bi_op_flags = 0;
-#else
-	iorq.bi_rw = rw;
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	iorq.mem.type = DM_IO_BIO;
 	iorq.mem.ptr.bio = bio;
-#else
-	iorq.mem.type = DM_IO_BVEC;
-	iorq.mem.ptr.bvec = bvec;
-#endif
 	iorq.notify.fn = fn;
 	iorq.notify.context = context;
 	iorq.client = dmc->io_client;
@@ -269,24 +253,11 @@ void rc_io_callback(unsigned long error, void *context)
 		if (error || invalid) {
 			if (invalid)
 				DMERR("%s: cache fill invalidation, sector %lu, size %u",
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 				      __func__,
 				      (unsigned long)bio->bi_iter.bi_sector,
 				      bio->bi_iter.bi_size);
-#else
-				      __func__, (unsigned long)bio->bi_sector,
-				      bio->bi_size);
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-			bio_endio(bio, error);
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,13,0)
 			bio->bi_status= error;
-#else
-			bio->bi_error = error;
-#endif
 			bio_io_error(bio);
-#endif
 			spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 			dmc->cache_state[job->index] = INVALID;
 			spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
@@ -305,11 +276,7 @@ void rc_io_callback(unsigned long error, void *context)
 			invalid++;
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
 		if (!invalid && !error) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-			bio_endio(bio, 0);
-#else
 			bio_endio(bio);
-#endif
 			spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 			dmc->cache_state[job->index] = VALID;
 			spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
@@ -322,11 +289,7 @@ void rc_io_callback(unsigned long error, void *context)
 		return;
 	} else {
 		ASSERT(job->rw == WRITECACHE);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-		bio_endio(bio, 0);
-#else
 		bio_endio(bio);
-#endif
 		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 		ASSERT((dmc->cache_state[job->index] == INPROG) ||
 		       (dmc->cache_state[job->index] == INPROG_INVALID));
@@ -353,11 +316,7 @@ static int do_io(struct kcached_job *job)
 
 	ASSERT(job->rw == WRITECACHE);
 	dmc->cache_writes++;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	r = dm_io_async_bvec(1, &job->cache, WRITE, bio, rc_io_callback, job);
-#else
-	r = dm_io_async_bvec(1, &job->cache, WRITE, bio->bi_io_vec + bio->bi_idx, rc_io_callback, job);
-#endif
 	ASSERT(r == 0); /* dm_io_async_bvec() must always return 0 */
 	return r;
 }
@@ -487,11 +446,7 @@ static void find_reclaim_dbn(struct cache_context *dmc,
 /* dbn is the starting sector, io_size is the number of sectors. */
 static int cache_lookup(struct cache_context *dmc, struct bio *bio, int *index)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	sector_t dbn = bio->bi_iter.bi_sector;
-#else
-	sector_t dbn = bio->bi_sector;
-#endif
 	unsigned long set_number = hash_block(dmc, dbn);
 	int invalid = -1, oldest_clean = -1;
 	int start_index;
@@ -532,19 +487,11 @@ static struct kcached_job *new_kcached_job(struct cache_context *dmc,
 	if (!job)
 		return NULL;
 	job->disk.bdev = dmc->disk_dev->bdev;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	job->disk.sector = bio->bi_iter.bi_sector;
-#else
-	job->disk.sector = bio->bi_sector;
-#endif
 	if (index != -1)
 		job->disk.count = dmc->block_size;
 	else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 		job->disk.count = to_sector(bio->bi_iter.bi_size);
-#else
-		job->disk.count = to_sector(bio->bi_size);
-#endif
 	job->cache.bdev = dmc->cache_dev->bdev;
 	if (index != -1) {
 		job->cache.sector = index << dmc->block_shift;
@@ -569,27 +516,14 @@ static void cache_read_miss(struct cache_context *dmc,
 		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 		dmc->cache_state[index] = INVALID;
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-		bio_endio(bio, -EIO);
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,13,0)
 		bio->bi_status = -EIO;
-#else
-		bio->bi_error = -EIO;
-#endif
 		bio_io_error(bio);
-#endif
 	} else {
 		job->rw = READSOURCE;
 		atomic_inc(&dmc->nr_jobs);
 		dmc->disk_reads++;
 		dm_io_async_bvec(1, &job->disk, READ,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 				 bio, rc_io_callback, job);
-#else
-				 bio->bi_io_vec + bio->bi_idx,
-				 rc_io_callback, job);
-#endif
 	}
 }
 
@@ -601,13 +535,8 @@ static void cache_read(struct cache_context *dmc, struct bio *bio)
 
 	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 	res = cache_lookup(dmc, bio, &index);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	if ((res == VALID) &&
 	    (dmc->cache[index].dbn == bio->bi_iter.bi_sector)) {
-#else
-	if ((res == VALID) &&
-	    (dmc->cache[index].dbn == bio->bi_sector)) {
-#endif
 		struct kcached_job *job;
 
 		dmc->cache_state[index] = CACHEREADINPROG;
@@ -619,28 +548,14 @@ static void cache_read(struct cache_context *dmc, struct bio *bio)
 			spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 			dmc->cache_state[index] = VALID;
 			spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-			bio_endio(bio, -EIO);
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,13,0)
 			bio->bi_status = -EIO;
-#else
-			bio->bi_error = -EIO;
-#endif
 			bio_io_error(bio);
-#endif
 		} else {
 			job->rw = READCACHE;
 			atomic_inc(&dmc->nr_jobs);
 			dmc->cache_reads++;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 			dm_io_async_bvec(1, &job->cache, READ, bio,
 					 rc_io_callback, job);
-#else
-			dm_io_async_bvec(1, &job->cache, READ,
-					 bio->bi_io_vec + bio->bi_idx,
-					 rc_io_callback, job);
-#endif
 		}
 		return;
 	}
@@ -665,11 +580,7 @@ static void cache_read(struct cache_context *dmc, struct bio *bio)
 		dmc->replace++;
 	}
 	dmc->cache_state[index] = INPROG;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	dmc->cache[index].dbn = bio->bi_iter.bi_sector;
-#else
-	dmc->cache[index].dbn = bio->bi_sector;
-#endif
 	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
 	cache_read_miss(dmc, bio, index);
 }
@@ -714,13 +625,8 @@ static int cache_invalidate_block_set(struct cache_context *dmc, int set,
 
 static int cache_invalidate_blocks(struct cache_context *dmc, struct bio *bio)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	sector_t io_start = bio->bi_iter.bi_sector;
 	sector_t io_end = bio->bi_iter.bi_sector + (to_sector(bio->bi_iter.bi_size) - 1);
-#else
-	sector_t io_start = bio->bi_sector;
-	sector_t io_end = bio->bi_sector + (to_sector(bio->bi_size) - 1);
-#endif
 	int start_set, end_set;
 	int inprog_inval_start = 0, inprog_inval_end = 0;
 
@@ -761,11 +667,7 @@ static void cache_write(struct cache_context *dmc, struct bio *bio)
 		dmc->cache_wr_replace++;
 	}
 	dmc->cache_state[index] = INPROG;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	dmc->cache[index].dbn = bio->bi_iter.bi_sector;
-#else
-	dmc->cache[index].dbn = bio->bi_sector;
-#endif
 	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
 	job = new_kcached_job(dmc, bio, index);
 	if (unlikely(!job)) {
@@ -773,49 +675,19 @@ static void cache_write(struct cache_context *dmc, struct bio *bio)
 		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 		dmc->cache_state[index] = INVALID;
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-		bio_endio(bio, -EIO);
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,13,0)
 		bio->bi_status= -EIO;
-#else
-		bio->bi_error = -EIO;
-#endif
 		bio_io_error(bio);
-#endif
 		return;
 	}
 	job->rw = WRITESOURCE;
 	atomic_inc(&job->dmc->nr_jobs);
 	dmc->disk_writes++;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	dm_io_async_bvec(1, &job->disk, WRITE, bio, rc_io_callback, job);
-#else
-	dm_io_async_bvec(1, &job->disk, WRITE, bio->bi_io_vec + bio->bi_idx, rc_io_callback, job);
-#endif
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,32)
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,36)
-#define bio_barrier(bio)		((bio)->bi_rw & (1 << BIO_RW_BARRIER))
-#else
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,37)
-#define bio_barrier(bio)		((bio)->bi_rw & REQ_HARDBARRIER)
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
 #define bio_barrier(bio)		((bio)->bi_opf & REQ_PREFLUSH)
-#else
-#define bio_barrier(bio)		((bio)->bi_rw & REQ_FLUSH)
-#endif
-#endif
-#endif
-#endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,8,0)
 int rc_map(struct dm_target *ti, struct bio *bio)
-#else
-int rc_map(struct dm_target *ti, struct bio *bio, union map_info *map_context)
-#endif
 {
 	struct cache_context *dmc = (struct cache_context *)ti->private;
 	unsigned long flags;
@@ -823,21 +695,13 @@ int rc_map(struct dm_target *ti, struct bio *bio, union map_info *map_context)
 	if (bio_barrier(bio))
 		return -EOPNOTSUPP;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	ASSERT(to_sector(bio->bi_iter.bi_size) <= dmc->block_size);
-#else
-	ASSERT(to_sector(bio->bi_size) <= dmc->block_size);
-#endif
 	if (bio_data_dir(bio) == READ)
 		dmc->reads++;
 	else
 		dmc->writes++;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	if (to_sector(bio->bi_iter.bi_size) != dmc->block_size ||
-#else
-	if (to_sector(bio->bi_size) != dmc->block_size ||
-#endif
 	    (dmc->mode && (bio_data_dir(bio) == WRITE))) {
 
 		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
@@ -867,20 +731,12 @@ static void rc_uncached_io_callback(unsigned long error, void *context)
 		dmc->uncached_writes++;
 	(void)cache_invalidate_blocks(dmc, job->bio);
 	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-	bio_endio(job->bio, error);
-#else
 	if (error) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,13,0)
 		job->bio->bi_status = error;
-#else
-		job->bio->bi_error = error;
-#endif
 		bio_io_error(job->bio);
 	} else {
 		bio_endio(job->bio);
 	}
-#endif
 	mempool_free(job, job_pool);
 	if (atomic_dec_and_test(&dmc->nr_jobs))
 		wake_up(&dmc->destroyq);
@@ -893,16 +749,8 @@ static void rc_start_uncached_io(struct cache_context *dmc, struct bio *bio)
 
 	job = new_kcached_job(dmc, bio, -1);
 	if (unlikely(!job)) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-		bio_endio(bio, -EIO);
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,13,0)
 		bio->bi_status= -EIO;
-#else
-		bio->bi_error = -EIO;
-#endif
 		bio_io_error(bio);
-#endif
 		return;
 	}
 	atomic_inc(&dmc->nr_jobs);
@@ -911,11 +759,7 @@ static void rc_start_uncached_io(struct cache_context *dmc, struct bio *bio)
 	else
 		dmc->disk_writes++;
 	dm_io_async_bvec(1, &job->disk, ((is_write) ? WRITE : READ),
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 			 bio, rc_uncached_io_callback, job);
-#else
-			 bio->bi_io_vec + bio->bi_idx, rc_uncached_io_callback, job);
-#endif
 }
 
 static inline int rc_get_dev(struct dm_target *ti, char *pth,
@@ -924,15 +768,7 @@ static inline int rc_get_dev(struct dm_target *ti, char *pth,
 {
 	int rc;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,34)
 	rc = dm_get_device(ti, pth, dm_table_get_mode(ti->table), dmd);
-#else
-#if defined(RHEL_MAJOR) && RHEL_MAJOR == 6
-	rc = dm_get_device(ti, pth, dm_table_get_mode(ti->table), dmd);
-#else 
-	rc = dm_get_device(ti, pth, 0, tilen, dm_table_get_mode(ti->table), dmd);
-#endif
-#endif
 	if (!rc)
 		strncpy(dmc_dname, pth, DEV_PATHLEN);
 	return rc;
@@ -982,22 +818,12 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto construct_fail2;
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,27)
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,39)
 	dmc->io_client = dm_io_client_create();
-#else
-#if defined(RHEL_MAJOR) && RHEL_MAJOR == 6 && RHEL_MINOR >= 4
-	dmc->io_client = dm_io_client_create();
-#else
-	dmc->io_client = dm_io_client_create(COPY_PAGES);
-#endif
-#endif
 	if (IS_ERR(dmc->io_client)) {
 		r = PTR_ERR(dmc->io_client);
 		ti->error = "Failed to create io client\n";
 		goto construct_fail3;
 	}
-#endif
 
 	r = kcached_init(dmc);
 	if (r) {
@@ -1105,13 +931,9 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	dmc->cached_blocks = 0;
 	dmc->cache_wr_replace = 0;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,6,0)
-	ti->split_io = dmc->block_size;
-#else
 	r = dm_set_target_max_io_len(ti, dmc->block_size);
 	if (r)
 		goto construct_fail8;
-#endif
 	ti->private = dmc;
 
 	return 0;
@@ -1126,9 +948,7 @@ construct_fail6:
 construct_fail5:
 	kcached_client_destroy(dmc);
 construct_fail4:
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,27)
 	dm_io_client_destroy(dmc->io_client);
-#endif
 construct_fail3:
 	dm_put_device(ti, dmc->cache_dev);
 construct_fail2:
@@ -1159,9 +979,7 @@ static void cache_dtr(struct dm_target *ti)
 			(unsigned long)dmc->size, dmc->cached_blocks);
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,27)
 	dm_io_client_destroy(dmc->io_client);
-#endif
 	vfree(dmc->cache);
 	vfree(dmc->cache_state);
 	vfree(dmc->set_lru_next);
@@ -1204,18 +1022,9 @@ static void rc_status_table(struct cache_context *dmc, status_type_t type,
 		(unsigned long)dmc->size, dmc->cached_blocks);
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,3)
-static int
-#else
 static void
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,6,0)
-cache_status(struct dm_target *ti, status_type_t type, char *result,
-	     unsigned int maxlen)
-#else
 cache_status(struct dm_target *ti, status_type_t type, unsigned status_flags,
 	     char *result, unsigned int maxlen)
-#endif
 {
 	struct cache_context *dmc = (struct cache_context *)ti->private;
 
@@ -1227,9 +1036,6 @@ cache_status(struct dm_target *ti, status_type_t type, unsigned status_flags,
 		rc_status_table(dmc, type, result, maxlen);
 		break;
 	}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,3)
-	return 0;
-#endif
 }
 
 static struct target_type cache_target = {

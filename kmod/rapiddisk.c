@@ -29,11 +29,7 @@
 #include <linux/version.h>
 #include <linux/blkdev.h>
 #include <linux/bio.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0)
 #include <linux/fs.h>
-#else
-#include <linux/buffer_head.h>
-#endif
 #include <linux/hdreg.h>
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
@@ -93,26 +89,10 @@ module_param(rd_max_nr, int, S_IRUGO);
 MODULE_PARM_DESC(rd_max_nr, " Maximum number of RAM Disks. (Default = 128)");
 
 static int rdsk_do_bvec(struct rdsk_device *, struct page *,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
 			unsigned int, unsigned int, bool, sector_t);
-#else
-			unsigned int, unsigned int, int, sector_t);
-#endif
 static int rdsk_ioctl(struct block_device *, fmode_t,
 		      unsigned int, unsigned long);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,2,0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
-static blk_qc_t rdsk_submit_bio(struct bio *);
-#else
 static blk_qc_t rdsk_make_request(struct request_queue *, struct bio *);
-#endif
-#else
-static void rdsk_make_request(struct request_queue *, struct bio *);
-#endif
-#else
-static int rdsk_make_request(struct request_queue *, struct bio *);
-#endif
 static int attach_device(int);    /* disk size */
 static int detach_device(int);	  /* disk num */
 static int resize_device(int, int); /* disk num, disk size */
@@ -265,7 +245,6 @@ static struct page *rdsk_insert_page(struct rdsk_device *rdsk, sector_t sector)
 	return page;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36)
 static void rdsk_zero_page(struct rdsk_device *rdsk, sector_t sector)
 {
 	struct page *page;
@@ -274,7 +253,6 @@ static void rdsk_zero_page(struct rdsk_device *rdsk, sector_t sector)
 	if (page)
 		clear_highpage(page);
 }
-#endif
 
 static void rdsk_free_pages(struct rdsk_device *rdsk)
 {
@@ -319,7 +297,6 @@ static int copy_to_rdsk_setup(struct rdsk_device *rdsk,
 	return 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36)
 static void discard_from_rdsk(struct rdsk_device *rdsk,
 			      sector_t sector, size_t n)
 {
@@ -329,7 +306,6 @@ static void discard_from_rdsk(struct rdsk_device *rdsk,
 		n -= PAGE_SIZE;
 	}
 }
-#endif
 
 static void copy_to_rdsk(struct rdsk_device *rdsk, const void *src,
 			 sector_t sector, size_t n)
@@ -343,17 +319,9 @@ static void copy_to_rdsk(struct rdsk_device *rdsk, const void *src,
 	page = rdsk_lookup_page(rdsk, sector);
 	BUG_ON(!page);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0)
 	dst = kmap_atomic(page);
-#else
-	dst = kmap_atomic(page, KM_USER1);
-#endif
 	memcpy(dst + offset, src, copy);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0)
 	kunmap_atomic(dst);
-#else
-	kunmap_atomic(dst, KM_USER1);
-#endif
 
 	if (copy < n) {
 		src += copy;
@@ -361,17 +329,9 @@ static void copy_to_rdsk(struct rdsk_device *rdsk, const void *src,
 		copy = n - copy;
 		page = rdsk_lookup_page(rdsk, sector);
 		BUG_ON(!page);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0)
 		dst = kmap_atomic(page);
-#else
-		dst = kmap_atomic(page, KM_USER1);
-#endif
 		memcpy(dst, src, copy);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0)
 		kunmap_atomic(dst);
-#else
-		kunmap_atomic(dst, KM_USER1);
-#endif
 	}
 
 	if ((sector + (n / BYTES_PER_SECTOR)) > rdsk->max_blk_alloc)
@@ -390,17 +350,9 @@ static void copy_from_rdsk(void *dst, struct rdsk_device *rdsk,
 	page = rdsk_lookup_page(rdsk, sector);
 
 	if (page) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0)
 		src = kmap_atomic(page);
-#else
-		src = kmap_atomic(page, KM_USER1);
-#endif
 		memcpy(dst, src + offset, copy);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0)
 		kunmap_atomic(src);
-#else
-		kunmap_atomic(src, KM_USER1);
-#endif
 	} else {
 		memset(dst, 0, copy);
 	}
@@ -411,17 +363,9 @@ static void copy_from_rdsk(void *dst, struct rdsk_device *rdsk,
 		copy = n - copy;
 		page = rdsk_lookup_page(rdsk, sector);
 		if (page) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0)
 			src = kmap_atomic(page);
-#else
-			src = kmap_atomic(page, KM_USER1);
-#endif
 			memcpy(dst, src, copy);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0)
 			kunmap_atomic(src);
-#else
-			kunmap_atomic(src, KM_USER1);
-#endif
 		} else {
 			memset(dst, 0, copy);
 		}
@@ -429,187 +373,70 @@ static void copy_from_rdsk(void *dst, struct rdsk_device *rdsk,
 }
 
 static int rdsk_do_bvec(struct rdsk_device *rdsk, struct page *page,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
 			unsigned int len, unsigned int off, bool is_write,
-#else
-			unsigned int len, unsigned int off, int rw,
-#endif
 			sector_t sector){
 	void *mem;
 	int err = 0;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
 	if (is_write) {
-#else
-	if (rw != READ) {
-#endif
 		err = copy_to_rdsk_setup(rdsk, sector, len);
 		if (err)
 			goto out;
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0)
 	mem = kmap_atomic(page);
-#else
-	mem = kmap_atomic(page, KM_USER0);
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
 	if (!is_write) {
-#else
-	if (rw == READ) {
-#endif
 		copy_from_rdsk(mem + off, rdsk, sector, len);
 		flush_dcache_page(page);
 	} else {
 		flush_dcache_page(page);
 		copy_to_rdsk(rdsk, mem + off, sector, len);
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0)
 	kunmap_atomic(mem);
-#else
-	kunmap_atomic(mem, KM_USER0);
-#endif
 out:
 	return err;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,2,0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 static blk_qc_t
-#else
-static void
-#endif
-#else
-static int
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
-rdsk_submit_bio(struct bio *bio)
-#else
 rdsk_make_request(struct request_queue *q, struct bio *bio)
-#endif
 {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)) && (LINUX_VERSION_CODE < KERNEL_VERSION(5,12,0))
 	struct rdsk_device *rdsk = bio->bi_disk->private_data;
-#else
-	struct block_device *bdev = bio->bi_bdev;
-	struct rdsk_device *rdsk = bdev->bd_disk->private_data;
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
-	int rw;
-#endif
 	sector_t sector;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	struct bio_vec bvec;
 	struct bvec_iter iter;
-#else
-	struct bio_vec *bvec;
-	int i;
-#endif
 	int err = -EIO;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	sector = bio->bi_iter.bi_sector;
-#else
-	sector = bio->bi_sector;
-#endif
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)) && (LINUX_VERSION_CODE < KERNEL_VERSION(5,12,0))
 	if ((sector + bio_sectors(bio)) > get_capacity(bio->bi_disk))
-#else
-	if ((sector + bio_sectors(bio)) > get_capacity(bdev->bd_disk))
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-		goto out;
-#else
 		goto io_error;
-#endif
 
 	err = 0;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,336)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
 	if (unlikely(bio_op(bio) == REQ_OP_DISCARD)) {
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,12,0)
-	if ((unlikely(bio_op(bio) == REQ_OP_DISCARD)) || (unlikely(bio_op(bio) == REQ_OP_WRITE_ZEROES))) {
-#else
-	if (unlikely(bio->bi_rw & REQ_DISCARD)) {
-#endif
 		if (sector & ((PAGE_SIZE >> SECTOR_SHIFT) - 1) ||
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 		    bio->bi_iter.bi_size & ~PAGE_MASK)
-#else
-		    bio->bi_size & ~PAGE_MASK)
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,3,0)
 		goto io_error;
-#else
-		goto out;
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 		discard_from_rdsk(rdsk, sector, bio->bi_iter.bi_size);
-#else
-		discard_from_rdsk(rdsk, sector, bio->bi_size);
-#endif
 		goto out;
 	}
-#endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
-	rw = bio_rw(bio);
-	if (rw == READA)
-		rw = READ;
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	bio_for_each_segment(bvec, bio, iter) {
 		unsigned int len = bvec.bv_len;
 
 		err = rdsk_do_bvec(rdsk, bvec.bv_page, len,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
 				   bvec.bv_offset, op_is_write(bio_op(bio)), sector);
-#else
-				   bvec.bv_offset, rw, sector);
-#endif
-#else
-	bio_for_each_segment(bvec, bio, i) {
-		unsigned int len = bvec->bv_len;
-
-		err = rdsk_do_bvec(rdsk, bvec->bv_page, len,
-				   bvec->bv_offset, rw, sector);
-#endif
 		if (err) {
 			rdsk->error_cnt++;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-			break;
-#else
 			goto io_error;
-#endif
 		}
 		sector += len >> SECTOR_SHIFT;
 	}
 
 out:
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-	set_bit(BIO_UPTODATE, &bio->bi_flags);
-	bio_endio(bio, err);
-#else
 	bio_endio(bio);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 	return BLK_QC_T_NONE;
-#else
-	return;
-#endif
 io_error:
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,13,0)
 	bio->bi_status= err;
-#else
-	bio->bi_error = err;
-#endif
 	bio_io_error(bio);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 	return BLK_QC_T_NONE;
-#endif
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,2,0)
-	return 0;
-#endif
 }
 
 static int rdsk_ioctl(struct block_device *bdev, fmode_t mode,
@@ -636,16 +463,7 @@ static int rdsk_ioctl(struct block_device *bdev, fmode_t mode,
 		mutex_lock(&bdev->bd_mutex);
 		error = -EBUSY;
 		if (bdev->bd_openers <= 1) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 8 && RHEL_MINOR >= 4)
-			invalidate_bdev(bdev);
-#else
 			kill_bdev(bdev);
-#endif
-#else
-			invalidate_bh_lrus();
-			truncate_inode_pages(bdev->bd_inode->i_mapping, 0);
-#endif
 			rdsk_free_pages(rdsk);
 			error = 0;
 		}
@@ -672,9 +490,6 @@ static int rdsk_ioctl(struct block_device *bdev, fmode_t mode,
 
 static const struct block_device_operations rdsk_fops = {
 	.owner = THIS_MODULE,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
-	.submit_bio = rdsk_submit_bio,
-#endif
 	.ioctl = rdsk_ioctl,
 };
 
@@ -718,49 +533,20 @@ static int attach_device(int size)
 	spin_lock_init(&rdsk->rdsk_lock);
 	INIT_RADIX_TREE(&rdsk->rdsk_pages, GFP_ATOMIC);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
-	rdsk->rdsk_queue = blk_alloc_queue(NUMA_NO_NODE);
-#else
-	rdsk->rdsk_queue = blk_alloc_queue(rdsk_make_request, NUMA_NO_NODE);
-#endif
-	if (!rdsk->rdsk_queue)
-		goto out_free_dev;
-#else
 	rdsk->rdsk_queue = blk_alloc_queue(GFP_KERNEL);
 	if (!rdsk->rdsk_queue)
 		goto out_free_dev;
 	blk_queue_make_request(rdsk->rdsk_queue, rdsk_make_request);
-#endif
 	blk_queue_logical_block_size(rdsk->rdsk_queue, BYTES_PER_SECTOR);
 	blk_queue_physical_block_size(rdsk->rdsk_queue, PAGE_SIZE);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,7,0)
 	blk_queue_write_cache(rdsk->rdsk_queue, true, false);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,37)
-	blk_queue_flush(rdsk->rdsk_queue, REQ_FLUSH);
-#else
-	blk_queue_ordered(rdsk->rdsk_queue, QUEUE_ORDERED_TAG, NULL);
-#endif
 
 	rdsk->rdsk_queue->limits.max_sectors = (max_sectors * 2);
 	rdsk->rdsk_queue->nr_requests = nr_requests;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36)
 	rdsk->rdsk_queue->limits.discard_granularity = PAGE_SIZE;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,12,0)
-	rdsk->rdsk_queue->limits.discard_zeroes_data = 1;
-#endif
 	rdsk->rdsk_queue->limits.max_discard_sectors = UINT_MAX;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,17,0)
 	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, rdsk->rdsk_queue);
-#else
-	blk_queue_flag_set(QUEUE_FLAG_DISCARD, rdsk->rdsk_queue);
-#endif
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,17,0)
 	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, rdsk->rdsk_queue);
-#else
-	blk_queue_flag_set(QUEUE_FLAG_NONROT, rdsk->rdsk_queue);
-#endif
 
 	disk = rdsk->rdsk_disk = alloc_disk(1);
 	if (!disk)
