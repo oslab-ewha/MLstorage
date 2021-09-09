@@ -60,7 +60,7 @@ struct rdsk_device {
 	struct gendisk *rdsk_disk;
 	struct list_head rdsk_list;
 	unsigned long long max_blk_alloc;	/* rdsk: to keep track of highest sector write	*/
-	unsigned long long size;
+	unsigned long long size, size_spare;
 	unsigned long error_cnt;
 	spinlock_t rdsk_lock;
 	struct radix_tree_root rdsk_pages;
@@ -71,17 +71,11 @@ static int rd_max_nr = MAX_RDSKS;
 static int max_sectors = DEFAULT_MAX_SECTS, nr_requests = DEFAULT_REQUESTS;
 static LIST_HEAD(rdsk_devices);
 static struct kobject *rdsk_kobj;
-static int rd_nr = 0;
-int rd_size = 0;
 
 module_param(max_sectors, int, S_IRUGO);
 MODULE_PARM_DESC(max_sectors, " max sectors (in KB) for the request queue. (Default = 127)");
 module_param(nr_requests, int, S_IRUGO);
 MODULE_PARM_DESC(nr_requests, " # of requests at a given time for the request queue. (Default = 128)");
-module_param(rd_nr, int, S_IRUGO);
-MODULE_PARM_DESC(rd_nr, " max number of stolearn-nn devices to load on insertion. (Default = 0)");
-module_param(rd_size, int, S_IRUGO);
-MODULE_PARM_DESC(rd_size, " size of each RAM disk (in KB) loaded on insertion. (Default = 0)");
 module_param(rd_max_nr, int, S_IRUGO);
 MODULE_PARM_DESC(rd_max_nr, " max number of RAM Disks. (Default = 128)");
 
@@ -90,7 +84,7 @@ static int rdsk_do_bvec(struct rdsk_device *, struct page *,
 static int rdsk_ioctl(struct block_device *, fmode_t,
 		      unsigned int, unsigned long);
 static blk_qc_t rdsk_make_request(struct request_queue *, struct bio *);
-static int attach_device(int);    /* disk size */
+static int attach_device(int, int);    /* disk size(in MB) */
 static int detach_device(int);	  /* disk num */
 static ssize_t mgmt_show(struct kobject *, struct kobj_attribute *, char *);
 static ssize_t mgmt_store(struct kobject *, struct kobj_attribute *,
@@ -112,11 +106,50 @@ static ssize_t mgmt_show(struct kobject *kobj, struct kobj_attribute *attr,
 	return len;
 }
 
-static ssize_t mgmt_store(struct kobject *kobj, struct kobj_attribute *attr,
-			  const char *buffer, size_t count)
+static ssize_t
+mgmt_attach_device(char *buf)
 {
-	int num, size, err = (int)count;
-	char *ptr, *buf;
+	unsigned int	size, size_spare;
+	int	n_scanned;
+
+	n_scanned = sscanf(buf, "%u %u", &size, &size_spare);
+	if (n_scanned <= 0) {
+		pr_err("%s: wrong attach format: %s\n", PREFIX, buf);
+		return -EINVAL;
+	}
+	if (n_scanned == 1)
+		size_spare = 0;
+
+	if (attach_device(size, size_spare) != 0) {
+		pr_err("%s: Unable to attach a new stolearn-nn device.\n", PREFIX);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static ssize_t
+mgmt_detach_device(char *buf)
+{
+	unsigned int	num;
+
+	if (kstrtouint(buf, 0, &num) < 0) {
+		pr_err("%s: wrong detach format: %s\n", PREFIX, buf);
+		return -EINVAL;
+	}
+
+	if (detach_device(num) != 0) {
+		pr_err("%s: Unable to detach stolearn-nn%d\n", PREFIX, num);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static ssize_t
+mgmt_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buffer, size_t count)
+{
+	char	*buf;
+	int	err;
 
 	if (!buffer || count > PAGE_SIZE)
 		return -EINVAL;
@@ -129,23 +162,11 @@ static ssize_t mgmt_store(struct kobject *kobj, struct kobj_attribute *attr,
 	}
 	strcpy(buf, buffer);
 
-	if (!strncmp("stolearn-nn attach ", buffer, 19)) {
-		ptr = buf + 19;
-		size = (simple_strtoul(ptr, &ptr, 0) * 2 * 1024);
-
-		if (attach_device(size) != 0) {
-			pr_err("%s: Unable to attach a new stolearn-nn device.\n", PREFIX);
-			err = -EINVAL;
-		}
-	} else if (!strncmp("stolearn-nn detach ", buffer, 19)) {
-		ptr = buf + 19;
-		num = simple_strtoul(ptr, &ptr, 0);
-
-		if (detach_device(num) != 0) {
-			pr_err("%s: Unable to detach stolearn-nn%d\n", PREFIX, num);
-			err = -EINVAL;
-		}
-	} else {
+	if (!strncmp("stolearn-nn attach ", buffer, 19))
+		err = mgmt_attach_device(buf + 19);
+	else if (!strncmp("stolearn-nn detach ", buffer, 19))
+		err = mgmt_detach_device(buf + 19);
+	else {
 		pr_err("%s: Unsupported command: %s\n", PREFIX, buffer);
 		err = -EINVAL;
 	}
@@ -153,6 +174,8 @@ static ssize_t mgmt_store(struct kobject *kobj, struct kobj_attribute *attr,
 	free_page((unsigned long)buf);
 write_sysfs_error:
 	mutex_unlock(&sysfs_mutex);
+	if (err == 0)
+		return count;
 	return err;
 }
 
@@ -393,8 +416,9 @@ rdsk_make_request(struct request_queue *q, struct bio *bio)
 	int err = -EIO;
 
 	sector = bio->bi_iter.bi_sector;
-	if ((sector + bio_sectors(bio)) > get_capacity(bio->bi_disk))
+	if ((sector + bio_sectors(bio)) > get_capacity(bio->bi_disk)) {
 		goto io_error;
+	}
 
 	err = 0;
 	if (unlikely(bio_op(bio) == REQ_OP_DISCARD)) {
@@ -480,7 +504,8 @@ static const struct block_device_operations rdsk_fops = {
 	.ioctl = rdsk_ioctl,
 };
 
-static int attach_device(int size)
+static int
+attach_device(int size, int size_spare)
 {
 	int num = 0;
 	struct rdsk_device *rdsk, *tmp;
@@ -516,7 +541,8 @@ static int attach_device(int size)
 	rdsk->num = num;
 	rdsk->error_cnt = 0;
 	rdsk->max_blk_alloc = 0;
-	rdsk->size = ((unsigned long long)size * BYTES_PER_SECTOR);
+	rdsk->size = ((unsigned long long)size * 2 * 1024 * BYTES_PER_SECTOR);
+	rdsk->size_spare = ((unsigned long long)size_spare * 2 * 1024 * BYTES_PER_SECTOR);
 	spin_lock_init(&rdsk->rdsk_lock);
 	INIT_RADIX_TREE(&rdsk->rdsk_pages, GFP_ATOMIC);
 
@@ -545,13 +571,12 @@ static int attach_device(int size)
 	disk->queue = rdsk->rdsk_queue;
 	disk->flags |= GENHD_FL_SUPPRESS_PARTITION_INFO;
 	sprintf(disk->disk_name, "stolearn-nn%d", num);
-	set_capacity(disk, size);
+	set_capacity(disk, rdsk->size / BYTES_PER_SECTOR);
 
 	add_disk(rdsk->rdsk_disk);
 	list_add_tail(&rdsk->rdsk_list, &rdsk_devices);
 	rd_total++;
-	pr_info("%s: Attached stolearn-nn%d of %llu bytes in size.\n", PREFIX,
-		num, rdsk->size);
+	pr_info("%s: Attached stolearn-nn%d of %llu bytes in size.\n", PREFIX, num, rdsk->size);
 	return 0;
 
 out_free_queue:
@@ -595,7 +620,7 @@ static int detach_device(int num)
 
 static int __init init_rd(void)
 {
-	int retval, i;
+	int	retval;
 
 	rd_total = rd_ma_no = 0;
 	rd_ma_no = register_blkdev(rd_ma_no, PREFIX);
@@ -612,14 +637,6 @@ static int __init init_rd(void)
 	if (retval)
 		goto init_failure2;
 
-	for (i = 0; i < rd_nr; i++) {
-		retval = attach_device(rd_size * 2);
-		if (retval) {
-			pr_err("%s: Failed to load stolearn-nn volume stolearn-nn%d.\n",
-			       PREFIX, i);
-			goto init_failure2;
-		}
-	}
 	return 0;
 
 init_failure2:

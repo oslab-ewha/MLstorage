@@ -777,7 +777,7 @@ static inline int rc_get_dev(struct dm_target *ti, char *pth,
 /* Construct a cache mapping.
  *  arg[0]: path to source device
  *  arg[1]: path to cache device
- *  arg[2]: cache size (in blocks)
+ *  arg[2]: size in MB
  *  arg[3]: mode: write through / around
  *  arg[4]: cache associativity */
 static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
@@ -834,14 +834,18 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	dmc->block_shift = ffs(dmc->block_size) - 1;
 	dmc->block_mask = dmc->block_size - 1;
 
+	dmc->size = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
+
 	if (argc >= 3) {
-		if (kstrtoul(argv[2], 10, (unsigned long *)&dmc->size)) {
-			ti->error = "stolearn-cache: Invalid cache size";
+		unsigned int	size_in_MB;
+
+		if (kstrtouint(argv[2], 0, &size_in_MB)) {
+			ti->error = "stolearn-cache: invalid size format";
 			r = -EINVAL;
 			goto construct_fail5;
 		}
-	} else {
-		dmc->size = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
+
+		dmc->size = to_sector(size_in_MB * 1024 * 1024);
 	}
 
 	if (argc >= 4) {
@@ -880,11 +884,8 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	dev_size = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
 	data_size = dmc->size * dmc->block_size;
 	if (data_size > dev_size) {
-		DMERR("Requested cache size exceeds the cache device's capacity (%lu>%lu)",
-		      (unsigned long)data_size, (unsigned long)dev_size);
-		ti->error = "stolearn-cache: Invalid cache size";
-		r = -EINVAL;
-		goto construct_fail5;
+		DMINFO("Requested cache size exceeds the cache device's capacity (%lu>%lu)",
+		       (unsigned long)data_size, (unsigned long)dev_size);
 	}
 
 	consecutive_blocks = dmc->assoc;
