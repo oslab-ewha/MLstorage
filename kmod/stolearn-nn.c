@@ -92,7 +92,6 @@ static int rdsk_ioctl(struct block_device *, fmode_t,
 static blk_qc_t rdsk_make_request(struct request_queue *, struct bio *);
 static int attach_device(int);    /* disk size */
 static int detach_device(int);	  /* disk num */
-static int resize_device(int, int); /* disk num, disk size */
 static ssize_t mgmt_show(struct kobject *, struct kobj_attribute *, char *);
 static ssize_t mgmt_store(struct kobject *, struct kobj_attribute *,
 			  const char *, size_t);
@@ -144,15 +143,6 @@ static ssize_t mgmt_store(struct kobject *kobj, struct kobj_attribute *attr,
 
 		if (detach_device(num) != 0) {
 			pr_err("%s: Unable to detach stolearn-nn%d\n", PREFIX, num);
-			err = -EINVAL;
-		}
-	} else if (!strncmp("stolearn-nn resize ", buffer, 19)) {
-		ptr = buf + 19;
-		num = simple_strtoul(ptr, &ptr, 0);
-		size = (simple_strtoul(ptr + 1, &ptr, 0) * 2 * 1024);
-
-		if (resize_device(num, size) != 0) {
-			pr_err("%s: Unable to resize stolearn-nn%d\n", PREFIX, num);
 			err = -EINVAL;
 		}
 	} else {
@@ -600,26 +590,6 @@ static int detach_device(int num)
 	rd_total--;
 	pr_info("%s: Detached stolearn-nn%d.\n", PREFIX, num);
 
-	return 0;
-}
-
-static int resize_device(int num, int size)
-{
-	struct rdsk_device	*rdsk;
-
-	rdsk = find_device(num);
-	if (rdsk == NULL)
-		return -1;
-
-	if (size <= get_capacity(rdsk->rdsk_disk)) {
-		pr_warn("%s: Please specify a larger size for resizing.\n",
-			PREFIX);
-		return GENERIC_ERROR;
-	}
-	set_capacity(rdsk->rdsk_disk, size);
-	rdsk->size = (size * BYTES_PER_SECTOR);
-	pr_info("%s: Resized stolearn-nn%d of %lu bytes in size.\n", PREFIX, num,
-	        (unsigned long)(size * BYTES_PER_SECTOR));
 	return 0;
 }
 
