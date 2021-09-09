@@ -16,7 +16,7 @@
  **
  ** SPDX-License-Identifier: GPL-2.0-only
  **
- ** filename: rapiddisk-cache.c
+ ** filename: stolearn-cache.c
  ** description: Device mapper target for block-level disk write-through and
  **	 write-around caching. This module is based on Flashcache-wt:
  **	  Copyright 2010 Facebook, Inc.
@@ -54,8 +54,8 @@
 	} \
 } while (0)
 
-#define VERSION_STR	"7.2.1"
-#define DM_MSG_PREFIX	"rapiddisk-cache"
+#define VERSION_STR	"1.0.0"
+#define DM_MSG_PREFIX	"stolearn-cache"
 
 #define READCACHE	1
 #define WRITECACHE	2
@@ -789,13 +789,13 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	int r = -EINVAL;
 
 	if (argc < 2) {
-		ti->error = "rapiddisk-cache: Need at least 2 arguments";
+		ti->error = "stolearn-cache: Need at least 2 arguments";
 		goto construct_fail;
 	}
 
 	dmc = kzalloc(sizeof(*dmc), GFP_KERNEL);
 	if (!dmc) {
-		ti->error = "rapiddisk-cache: Failed to allocate cache context";
+		ti->error = "stolearn-cache: Failed to allocate cache context";
 		r = -ENOMEM;
 		goto construct_fail;
 	}
@@ -804,17 +804,17 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	if (rc_get_dev(ti, argv[0], &dmc->disk_dev,
 	    dmc->disk_devname, ti->len)) {
-		ti->error = "rapiddisk-cache: Disk device lookup failed";
+		ti->error = "stolearn-cache: Disk device lookup failed";
 		goto construct_fail1;
 	}
-	if (strncmp(argv[1], "/dev/rd", 7) != 0) {
-		pr_err("%s: %s is not a valid cache device for rapiddisk-cache.",
+	if (strncmp(argv[1], "/dev/stolearn-nn", 16) != 0) {
+		pr_err("%s: %s is not a valid cache device for stolearn-cache.",
 		       DM_MSG_PREFIX, argv[1]);
-		ti->error = "rapiddisk-cache: Invalid cache device. Not a RapidDisk volume.";
+		ti->error = "stolearn-cache: invalid cache device. Not a stolearn-nn.";
 		goto construct_fail2;
 	}
 	if (rc_get_dev(ti, argv[1], &dmc->cache_dev, dmc->cache_devname, 0)) {
-		ti->error = "rapiddisk-cache: Cache device lookup failed";
+		ti->error = "stolearn-cache: Cache device lookup failed";
 		goto construct_fail2;
 	}
 
@@ -836,7 +836,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	if (argc >= 3) {
 		if (kstrtoul(argv[2], 10, (unsigned long *)&dmc->size)) {
-			ti->error = "rapiddisk-cache: Invalid cache size";
+			ti->error = "stolearn-cache: Invalid cache size";
 			r = -EINVAL;
 			goto construct_fail5;
 		}
@@ -846,7 +846,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	if (argc >= 4) {
 		if (sscanf(argv[3], "%d", &dmc->mode) != 1) {
-			ti->error = "rapiddisk-cache: Invalid mode";
+			ti->error = "stolearn-cache: Invalid mode";
 			r = -EINVAL;
 			goto construct_fail5;
                 }
@@ -856,13 +856,13 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	if (argc >= 5) {
 		if (kstrtoint(argv[4], 10, &dmc->assoc)) {
-			ti->error = "rapiddisk-cache: Invalid cache associativity";
+			ti->error = "stolearn-cache: Invalid cache associativity";
 			r = -EINVAL;
 			goto construct_fail5;
 		}
 		if (!dmc->assoc || (dmc->assoc & (dmc->assoc - 1)) ||
 		    dmc->size < dmc->assoc) {
-			ti->error = "rapiddisk-cache: Invalid cache associativity";
+			ti->error = "stolearn-cache: Invalid cache associativity";
 			r = -EINVAL;
 			goto construct_fail5;
 		}
@@ -882,7 +882,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (data_size > dev_size) {
 		DMERR("Requested cache size exceeds the cache device's capacity (%lu>%lu)",
 		      (unsigned long)data_size, (unsigned long)dev_size);
-		ti->error = "rapiddisk-cache: Invalid cache size";
+		ti->error = "stolearn-cache: Invalid cache size";
 		r = -EINVAL;
 		goto construct_fail5;
 	}
@@ -1012,7 +1012,7 @@ static void rc_status_table(struct cache_context *dmc, status_type_t type,
 {
 	int sz = 0;
 
-	DMEMIT("conf:\n\tRapidDisk dev (%s), disk dev (%s) mode (%s)\n"
+	DMEMIT("conf:\n\tStolearn-NN dev (%s), disk dev (%s) mode (%s)\n"
 		"\tcapacity(%luM), associativity(%u), block size(%uK)\n"
 		"\ttotal blocks(%lu), cached blocks(%lu)\n",
 		dmc->cache_devname, dmc->disk_devname,
@@ -1039,8 +1039,8 @@ cache_status(struct dm_target *ti, status_type_t type, unsigned status_flags,
 }
 
 static struct target_type cache_target = {
-	.name    = "rapiddisk-cache",
-	.version = {7, 2, 1},
+	.name    = "stolearn-cache",
+	.version = {1, 1, 0},
 	.module  = THIS_MODULE,
 	.ctr	 = cache_ctr,
 	.dtr	 = cache_dtr,
@@ -1079,7 +1079,7 @@ module_init(rc_init);
 module_exit(rc_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Petros Koutoupis <petros@petroskoutoupis.com>");
-MODULE_DESCRIPTION("RapidDisk-Cache DM target is a write-through caching target with RapidDisk volumes.");
+MODULE_AUTHOR("oslab <oslab@oslab.ewha.ac.kr>");
+MODULE_DESCRIPTION("Stolearn-Cache is a machine learning based caching target with NN model.");
 MODULE_VERSION(VERSION_STR);
-MODULE_INFO(Copyright, "Copyright 2010 - 2021 Petros Koutoupis");
+MODULE_INFO(Copyright, "Copyleft 2021 OSLAB, Ewha");
