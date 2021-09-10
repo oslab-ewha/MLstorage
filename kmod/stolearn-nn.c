@@ -60,7 +60,7 @@ struct rdsk_device {
 	struct gendisk *rdsk_disk;
 	struct list_head rdsk_list;
 	unsigned long long max_blk_alloc;	/* rdsk: to keep track of highest sector write	*/
-	unsigned long long size, size_spare;
+	unsigned long long size;
 	unsigned long error_cnt;
 	spinlock_t rdsk_lock;
 	struct radix_tree_root rdsk_pages;
@@ -84,7 +84,7 @@ static int rdsk_do_bvec(struct rdsk_device *, struct page *,
 static int rdsk_ioctl(struct block_device *, fmode_t,
 		      unsigned int, unsigned long);
 static blk_qc_t rdsk_make_request(struct request_queue *, struct bio *);
-static int attach_device(int, int);    /* disk size(in MB) */
+static int attach_device(int);    /* disk size(in MB) */
 static int detach_device(int);	  /* disk num */
 static ssize_t mgmt_show(struct kobject *, struct kobj_attribute *, char *);
 static ssize_t mgmt_store(struct kobject *, struct kobj_attribute *,
@@ -109,18 +109,16 @@ static ssize_t mgmt_show(struct kobject *kobj, struct kobj_attribute *attr,
 static ssize_t
 mgmt_attach_device(char *buf)
 {
-	unsigned int	size, size_spare;
+	unsigned int	size;
 	int	n_scanned;
 
-	n_scanned = sscanf(buf, "%u %u", &size, &size_spare);
+	n_scanned = sscanf(buf, "%u", &size);
 	if (n_scanned <= 0) {
 		pr_err("%s: wrong attach format: %s\n", PREFIX, buf);
 		return -EINVAL;
 	}
-	if (n_scanned == 1)
-		size_spare = 0;
 
-	if (attach_device(size, size_spare) != 0) {
+	if (attach_device(size) != 0) {
 		pr_err("%s: Unable to attach a new stolearn-nn device.\n", PREFIX);
 		return -EINVAL;
 	}
@@ -536,7 +534,7 @@ static const struct block_device_operations rdsk_fops = {
 };
 
 static int
-attach_device(int size, int size_spare)
+attach_device(int size)
 {
 	int num = 0;
 	struct rdsk_device *rdsk, *tmp;
@@ -573,7 +571,6 @@ attach_device(int size, int size_spare)
 	rdsk->error_cnt = 0;
 	rdsk->max_blk_alloc = 0;
 	rdsk->size = ((unsigned long long)size * 2 * 1024 * BYTES_PER_SECTOR);
-	rdsk->size_spare = ((unsigned long long)size_spare * 2 * 1024 * BYTES_PER_SECTOR);
 	spin_lock_init(&rdsk->rdsk_lock);
 	INIT_RADIX_TREE(&rdsk->rdsk_pages, GFP_ATOMIC);
 
