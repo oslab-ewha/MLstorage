@@ -33,7 +33,6 @@
 #include <linux/atomic.h>
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/list.h>
 #include <linux/blkdev.h>
 #include <linux/bio.h>
 #include <linux/vmalloc.h>
@@ -60,8 +59,8 @@
 #define VERSION_STR	"1.0.0"
 #define DM_MSG_PREFIX	"stolearn-cache"
 
-#define READSOURCE	3
-#define WRITESOURCE	4
+#define READ_BACKINGDEV		1
+#define WRITE_BACKINGDEV	2
 
 #define BYTES_PER_BLOCK		512
 /* Default cache parameters */
@@ -95,58 +94,51 @@ typedef struct _cacheinfo {
 } cacheinfo_t;
 #pragma pack(pop)
 
-/* Cache context */
-struct cache_context {
-	struct dm_target *tgt;
-	struct dm_dev *disk_dev;	/* Source device */
-	struct dm_dev *cache_dev;	/* Cache device */
-	pcache_t	*pcache;
+/* stolearn */
+typedef struct _stolearn {
+	struct dm_target	*tgt;
+	struct dm_dev		*disk_dev;	/* Source device */
+	struct dm_dev		*cache_dev;	/* Cache device */
+	pcache_t		*pcache;
 
-	spinlock_t cache_spin_lock;
+	spinlock_t	cache_spin_lock;
 	cacheinfo_t	*cacheinfos;
-	u32 *set_lru_next;
+	u32	*set_lru_next;
 
-	struct dm_io_client *io_client;
-	sector_t size, size_nominal;
-	unsigned int assoc;
-	unsigned int block_size;
-	unsigned int block_shift;
-	unsigned int block_mask;
-	unsigned int consecutive_shift;
+	struct dm_io_client	*io_client;
+	unsigned long	size, size_nominal;
+	unsigned int	assoc;
+	unsigned int	block_size;
+	unsigned int	block_shift;
+	unsigned int	consecutive_shift;
 
-	wait_queue_head_t destroyq;	/* Wait queue for I/O completion */
-	atomic_t nr_jobs;		/* Number of I/O jobs */
+	wait_queue_head_t	destroyq;	/* Wait queue for I/O completion */
+	atomic_t		nr_jobs;	/* Number of I/O jobs */
 
 	wait_queue_head_t	inprogq;	/* Wait queue for INPROG state completion */
 
 	/* Stats */
-	unsigned long reads;
-	unsigned long writes;
-	unsigned long cache_hits;
-	unsigned long replace;
-	unsigned long wr_invalidates;
-	unsigned long rd_invalidates;
-	unsigned long cached_blocks;
-	unsigned long cache_wr_replace;
-	unsigned long uncached_reads;
-	unsigned long uncached_writes;
-	unsigned long cache_reads, cache_writes;
-	unsigned long disk_reads, disk_writes;
+	unsigned long	reads, writes;
+	unsigned long	cache_hits;
+	unsigned long	replace;
+	unsigned long	cached_blocks;
+	unsigned long	cache_wr_replace;
+	unsigned long	cache_reads, cache_writes;
+	unsigned long	disk_reads, disk_writes;
 
-	char cache_devname[DEV_PATHLEN];
-	char disk_devname[DEV_PATHLEN];
-};
+	char	cache_devname[DEV_PATHLEN];
+	char	disk_devname[DEV_PATHLEN];
+} stolearn_t;
 
-/* Structure for a kcached job */
-struct kcached_job {
-	struct list_head list;
-	struct cache_context *dmc;
-	struct bio *bio;	/* Original bio */
-	struct dm_io_region disk;
-	int index;
-	int rw;
-	int error;
-};
+/* DM I/O job */
+typedef struct _dmio_job {
+	stolearn_t	*stl;
+	struct bio	*bio;	/* Original bio */
+	struct dm_io_region	disk;
+	int	index;
+	int	type;
+	int	error;
+} dmio_job_t;
 
 static struct kmem_cache	*job_cache;
 static mempool_t		*job_pool;
@@ -154,7 +146,7 @@ static mempool_t		*job_pool;
 static void
 dm_io_async_bvec(struct dm_io_region *where, int rw, struct bio *bio, io_notify_fn fn, void *context)
 {
-	struct kcached_job *job = (struct kcached_job *)context;
+	dmio_job_t *job = (dmio_job_t *)context;
 	struct dm_io_request iorq;
 
 	iorq.bi_op = rw;
@@ -163,7 +155,7 @@ dm_io_async_bvec(struct dm_io_region *where, int rw, struct bio *bio, io_notify_
 	iorq.mem.ptr.bio = bio;
 	iorq.notify.fn = fn;
 	iorq.notify.context = context;
-	iorq.client = job->dmc->io_client;
+	iorq.client = job->stl->io_client;
 
 	dm_io(&iorq, 1, where, NULL);
 }
@@ -171,7 +163,7 @@ dm_io_async_bvec(struct dm_io_region *where, int rw, struct bio *bio, io_notify_
 static int
 jobs_init(void)
 {
-	job_cache = kmem_cache_create("kcached-jobs-wt", sizeof(struct kcached_job), __alignof__(struct kcached_job), 0, NULL);
+	job_cache = kmem_cache_create("dmio-jobs", sizeof(dmio_job_t), __alignof__(dmio_job_t), 0, NULL);
 	if (!job_cache)
 		return -ENOMEM;
 
@@ -193,29 +185,29 @@ jobs_exit(void)
 }
 
 static void
-job_free(struct kcached_job *job)
+job_free(dmio_job_t *job)
 {
-	struct cache_context *dmc = job->dmc;
+	stolearn_t *stl = job->stl;
 
 	mempool_free(job, job_pool);
-	if (atomic_dec_and_test(&dmc->nr_jobs))
-		wake_up(&dmc->destroyq);
+	if (atomic_dec_and_test(&stl->nr_jobs))
+		wake_up(&stl->destroyq);
 }
 
 static void
-copy_bio_to_pcache(struct cache_context *dmc, struct bio *bio, int index)
+copy_bio_to_pcache(stolearn_t *stl, struct bio *bio, int index)
 {
-	cacheinfo_t	*ci = dmc->cacheinfos + index;
+	cacheinfo_t	*ci = stl->cacheinfos + index;
 	unsigned long	flags;
 	int	err;
 
-	if (to_sector(bio->bi_iter.bi_size) == dmc->block_size) {
-		sector_t	sector = index << dmc->block_shift;
+	if (to_sector(bio->bi_iter.bi_size) == stl->block_size) {
+		sector_t	sector = index << stl->block_shift;
 		int	err;
 
-		dmc->cache_writes++;
+		stl->cache_writes++;
 
-		err = pcache_submit(dmc->pcache, true, sector, bio);
+		err = pcache_submit(stl->pcache, true, sector, bio);
 	}
 	else {
 		err = -EINVAL;
@@ -223,27 +215,27 @@ copy_bio_to_pcache(struct cache_context *dmc, struct bio *bio, int index)
 
 	bio_endio(bio);
 
-	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+	spin_lock_irqsave(&stl->cache_spin_lock, flags);
 	ASSERT(ci->state == INPROG);
 
 	if (err != 0) {
 		ci->state = INVALID;
 	} else {
 		ci->state = VALID;
-		dmc->cached_blocks++;
+		stl->cached_blocks++;
 	}
 
-	wake_up_all(&dmc->inprogq);
-	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	wake_up_all(&stl->inprogq);
+	spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 }
 
 static void
-rc_io_callback(unsigned long err, void *context)
+dmio_done(unsigned long err, void *context)
 {
-	struct kcached_job	*job = (struct kcached_job *)context;
-	struct cache_context	*dmc = job->dmc;
+	dmio_job_t	*job = (dmio_job_t *)context;
+	stolearn_t	*stl = job->stl;
 	int	index = job->index;
-	cacheinfo_t	*ci = dmc->cacheinfos + index;
+	cacheinfo_t	*ci = stl->cacheinfos + index;
 	struct bio	*bio;
 	unsigned long	flags;
 
@@ -251,13 +243,13 @@ rc_io_callback(unsigned long err, void *context)
 	if (err)
 		DMERR("%s: io error %ld", __func__, err);
 
-	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+	spin_lock_irqsave(&stl->cache_spin_lock, flags);
 
 	ASSERT(ci->state == INPROG);
 	if (err) {
 		ci->state = INVALID;
-		wake_up_all(&dmc->inprogq);
-		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+		wake_up_all(&stl->inprogq);
+		spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 
 		bio->bi_status= err;
 		bio_io_error(bio);
@@ -265,57 +257,41 @@ rc_io_callback(unsigned long err, void *context)
 		job_free(job);
 	}
 	else {
-		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+		spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 		job_free(job);
-		copy_bio_to_pcache(dmc, bio, index);
+		copy_bio_to_pcache(stl, bio, index);
 	}
 }
 
-static int
-kcached_init(struct cache_context *dmc)
-{
-	init_waitqueue_head(&dmc->destroyq);
-	atomic_set(&dmc->nr_jobs, 0);
-
-	init_waitqueue_head(&dmc->inprogq);
-	return 0;
-}
-
-static void
-kcached_client_destroy(struct cache_context *dmc)
-{
-	wait_event(dmc->destroyq, !atomic_read(&dmc->nr_jobs));
-}
-
 static unsigned long
-hash_block(struct cache_context *dmc, sector_t dbn)
+hash_block(stolearn_t *stl, sector_t dbn)
 {
 	unsigned long	set_number;
 	uint64_t	value;
 
-	value = (dbn >> (dmc->block_shift + dmc->consecutive_shift));
-	set_number = do_div(value, (dmc->size >> dmc->consecutive_shift));
+	value = (dbn >> (stl->block_shift + stl->consecutive_shift));
+	set_number = do_div(value, (stl->size >> stl->consecutive_shift));
 	return set_number;
 }
 
 static bool
-find_valid_dbn(struct cache_context *dmc, sector_t dbn, int start_index, int *pindex, unsigned long *pflags)
+find_valid_dbn(stolearn_t *stl, sector_t dbn, int start_index, int *pindex, unsigned long *pflags)
 {
 	cacheinfo_t	*ci;
-	int	end_index = start_index + dmc->assoc;
+	int	end_index = start_index + stl->assoc;
 	int	i;
 
 again:
-	for (i = start_index, ci = dmc->cacheinfos + start_index; i < end_index; i++, ci++) {
+	for (i = start_index, ci = stl->cacheinfos + start_index; i < end_index; i++, ci++) {
 		if (dbn == ci->dbn) {
 			switch (ci->state) {
 			case VALID:
 				*pindex = i;
 				return true;
 			case INPROG:
-				spin_unlock_irqrestore(&dmc->cache_spin_lock, *pflags);
-				wait_event(dmc->inprogq, ci->state != INPROG);
-				spin_lock_irqsave(&dmc->cache_spin_lock, *pflags);
+				spin_unlock_irqrestore(&stl->cache_spin_lock, *pflags);
+				wait_event(stl->inprogq, ci->state != INPROG);
+				spin_lock_irqsave(&stl->cache_spin_lock, *pflags);
 				goto again;
 			default:
 				break;
@@ -326,14 +302,14 @@ again:
 }
 
 static bool
-find_invalid_dbn(struct cache_context *dmc, int start_index, int *pindex)
+find_invalid_dbn(stolearn_t *stl, int start_index, int *pindex)
 {
-	int	end_index = start_index + dmc->assoc;
+	int	end_index = start_index + stl->assoc;
 	int	i;
 
 	/* Find INVALID slot that we can reuse */
 	for (i = start_index; i < end_index; i++) {
-		if (dmc->cacheinfos[i].state == INVALID) {
+		if (stl->cacheinfos[i].state == INVALID) {
 			if (pindex)
 				*pindex = i;
 			return true;
@@ -343,14 +319,14 @@ find_invalid_dbn(struct cache_context *dmc, int start_index, int *pindex)
 }
 
 static bool
-has_nonprog_dbn(struct cache_context *dmc, int start_index)
+has_nonprog_dbn(stolearn_t *stl, int start_index)
 {
-	int	end_index = start_index + dmc->assoc;
+	int	end_index = start_index + stl->assoc;
 	int	i;
 
 	/* Find INVALID slot that we can reuse */
 	for (i = start_index; i < end_index; i++) {
-		if (dmc->cacheinfos[i].state != INPROG) {
+		if (stl->cacheinfos[i].state != INPROG) {
 			return true;
 		}
 	}
@@ -361,10 +337,10 @@ has_nonprog_dbn(struct cache_context *dmc, int start_index)
 	((index) + 1 == (end_index)) ? (start_index): ((index) + 1)
 
 static bool
-find_reclaim_dbn(struct cache_context *dmc, int start_index, int *pindex_reclaimed)
+find_reclaim_dbn(stolearn_t *stl, int start_index, int *pindex_reclaimed)
 {
-	int	end_index = start_index + dmc->assoc;
-	int	set = start_index / dmc->assoc;
+	int	end_index = start_index + stl->assoc;
+	int	set = start_index / stl->assoc;
 	int	slots_searched = 0;
 	int	index;
 
@@ -373,13 +349,13 @@ find_reclaim_dbn(struct cache_context *dmc, int start_index, int *pindex_reclaim
 	 * a VALID entry to recycle we advance this pointer. So  we sweep
 	 * through the set looking for next blocks to recycle. This
 	 * approximates to FIFO (modulo for blocks written through). */
-	index = dmc->set_lru_next[set];
-	while (slots_searched < dmc->assoc) {
+	index = stl->set_lru_next[set];
+	while (slots_searched < stl->assoc) {
 		ASSERT(index >= start_index && index < end_index);
 
-		if (IS_VALID_CACHE_STATE(dmc->cacheinfos[index].state)) {
+		if (IS_VALID_CACHE_STATE(stl->cacheinfos[index].state)) {
 			*pindex_reclaimed = index;
-			dmc->set_lru_next[set] = NEXT_INDEX(index, start_index, end_index);
+			stl->set_lru_next[set] = NEXT_INDEX(index, start_index, end_index);
 			return true;
 		}
 		slots_searched++;
@@ -390,29 +366,29 @@ find_reclaim_dbn(struct cache_context *dmc, int start_index, int *pindex_reclaim
 
 /* dbn is the starting sector, io_size is the number of sectors. */
 static bool
-cache_lookup(struct cache_context *dmc, struct bio *bio, int *pindex, unsigned long *pflags)
+cache_lookup(stolearn_t *stl, struct bio *bio, int *pindex, unsigned long *pflags)
 {
 	sector_t dbn = bio->bi_iter.bi_sector;
-	unsigned long	set_number = hash_block(dmc, dbn);
+	unsigned long	set_number = hash_block(stl, dbn);
 	int	index_invalid;
 	int	start_index;
 
-	start_index = dmc->assoc * set_number;
+	start_index = stl->assoc * set_number;
 
 again:
-	if (find_valid_dbn(dmc, dbn, start_index, pindex, pflags))
+	if (find_valid_dbn(stl, dbn, start_index, pindex, pflags))
 		return true;
 
-	if (find_invalid_dbn(dmc, start_index, &index_invalid))
+	if (find_invalid_dbn(stl, start_index, &index_invalid))
 		*pindex = index_invalid;
 	else {
 		int	index_reclaimed;
 
 		/* We didn't find an invalid entry, search for oldest valid entry */
-		if (!find_reclaim_dbn(dmc, start_index, &index_reclaimed)) {
-			spin_unlock_irqrestore(&dmc->cache_spin_lock, *pflags);
-			wait_event(dmc->inprogq, has_nonprog_dbn(dmc, start_index));
-			spin_lock_irqsave(&dmc->cache_spin_lock, *pflags);
+		if (!find_reclaim_dbn(stl, start_index, &index_reclaimed)) {
+			spin_unlock_irqrestore(&stl->cache_spin_lock, *pflags);
+			wait_event(stl->inprogq, has_nonprog_dbn(stl, start_index));
+			spin_lock_irqsave(&stl->cache_spin_lock, *pflags);
 			goto again;
 		}
 		*pindex = index_reclaimed;
@@ -421,19 +397,19 @@ again:
 	return INVALID;
 }
 
-static struct kcached_job *
-new_kcached_job(struct cache_context *dmc, struct bio *bio, int index)
+static dmio_job_t *
+new_dmio_job(stolearn_t *stl, struct bio *bio, int index)
 {
-	struct kcached_job	*job;
+	dmio_job_t	*job;
 
 	job = mempool_alloc(job_pool, GFP_NOIO);
 	if (job == NULL)
 		return NULL;
 
-	job->disk.bdev = dmc->disk_dev->bdev;
+	job->disk.bdev = stl->disk_dev->bdev;
 	job->disk.sector = bio->bi_iter.bi_sector;
 	job->disk.count = to_sector(bio->bi_iter.bi_size);
-	job->dmc = dmc;
+	job->stl = stl;
 	job->bio = bio;
 	job->index = index;
 	job->error = 0;
@@ -441,20 +417,20 @@ new_kcached_job(struct cache_context *dmc, struct bio *bio, int index)
 	return job;
 }
 
-static struct kcached_job *
-alloc_kcached_job(struct cache_context *dmc, struct bio *bio, int index)
+static dmio_job_t *
+alloc_dmio_job(stolearn_t *stl, struct bio *bio, int index)
 {
-	struct kcached_job *job;
+	dmio_job_t *job;
 
-	job = new_kcached_job(dmc, bio, index);
+	job = new_dmio_job(stl, bio, index);
 	if (unlikely(!job)) {
 		unsigned long	flags;
 
 		DMERR("failed to allocate job\n");
 
-		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-		dmc->cacheinfos[index].state = INVALID;
-		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+		spin_lock_irqsave(&stl->cache_spin_lock, flags);
+		stl->cacheinfos[index].state = INVALID;
+		spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 
 		bio->bi_status = -EIO;
 		bio_io_error(bio);
@@ -463,23 +439,23 @@ alloc_kcached_job(struct cache_context *dmc, struct bio *bio, int index)
 }
 
 static void
-copy_pcache_to_bio(struct cache_context *dmc, struct bio *bio, int index)
+copy_pcache_to_bio(stolearn_t *stl, struct bio *bio, int index)
 {
-	sector_t	sector = index << dmc->block_shift;
-	cacheinfo_t	*ci = dmc->cacheinfos + index;
+	sector_t	sector = index << stl->block_shift;
+	cacheinfo_t	*ci = stl->cacheinfos + index;
 	unsigned long	flags;
 	int	err;
 
-	dmc->cache_reads++;
-	err = pcache_submit(dmc->pcache, false, sector, bio);
+	stl->cache_reads++;
+	err = pcache_submit(stl->pcache, false, sector, bio);
 
-	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+	spin_lock_irqsave(&stl->cache_spin_lock, flags);
 
 	ASSERT(ci->state == VALID);
 	ASSERT(ci->n_readers > 0);
 	ci->n_readers--;
 
-	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 
 	if (err == 0)
 		bio_endio(bio);
@@ -490,118 +466,119 @@ copy_pcache_to_bio(struct cache_context *dmc, struct bio *bio, int index)
 }
 
 static void
-cache_read_miss(struct cache_context *dmc, struct bio *bio, int index)
+cache_read_miss(stolearn_t *stl, struct bio *bio, int index)
 {
-	struct kcached_job *job;
+	dmio_job_t	*job;
 
-	job = alloc_kcached_job(dmc, bio, index);
+	job = alloc_dmio_job(stl, bio, index);
 	if (likely(job)) {
-		job->rw = READSOURCE;
-		atomic_inc(&dmc->nr_jobs);
-		dmc->disk_reads++;
+		job->type = READ_BACKINGDEV;
+		atomic_inc(&stl->nr_jobs);
+		stl->disk_reads++;
 
-		dm_io_async_bvec(&job->disk, READ, bio, rc_io_callback, job);
+		dm_io_async_bvec(&job->disk, READ, bio, dmio_done, job);
 	}
 }
 
 static void
-cache_read(struct cache_context *dmc, struct bio *bio)
+cache_read(stolearn_t *stl, struct bio *bio)
 {
 	cacheinfo_t	*ci;
 	int	index;
 	unsigned long	flags;
 
-	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+	spin_lock_irqsave(&stl->cache_spin_lock, flags);
 
-	if (cache_lookup(dmc, bio, &index, &flags)) {
-		dmc->cacheinfos[index].n_readers++;
-		dmc->cache_hits++;
-		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	if (cache_lookup(stl, bio, &index, &flags)) {
+		stl->cacheinfos[index].n_readers++;
+		stl->cache_hits++;
+		spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 
-		copy_pcache_to_bio(dmc, bio, index);
+		copy_pcache_to_bio(stl, bio, index);
 		return;
 	}
 
-	ci = dmc->cacheinfos + index;
+	ci = stl->cacheinfos + index;
 
 	if (IS_VALID_CACHE_STATE(ci->state)) {
 		/* This means that cache read uses a victim cache */
-		dmc->cached_blocks--;
-		dmc->replace++;
+		stl->cached_blocks--;
+		stl->replace++;
 	}
 
 	ci->state = INPROG;
 	ci->dbn = bio->bi_iter.bi_sector;
 
-	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 
-	cache_read_miss(dmc, bio, index);
+	cache_read_miss(stl, bio, index);
 }
 
 static void
-cache_write(struct cache_context *dmc, struct bio *bio)
+cache_write(stolearn_t *stl, struct bio *bio)
 {
-	struct kcached_job	*job;
+	dmio_job_t	*job;
 	cacheinfo_t	*ci;
 	int	index;
 	unsigned long	flags;
 
-	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+	spin_lock_irqsave(&stl->cache_spin_lock, flags);
 
-	cache_lookup(dmc, bio, &index, &flags);
+	cache_lookup(stl, bio, &index, &flags);
 
-	ci = dmc->cacheinfos + index;
+	ci = stl->cacheinfos + index;
 
 	if (IS_VALID_CACHE_STATE(ci->state)) {
-		dmc->cached_blocks--;
-		dmc->cache_wr_replace++;
+		stl->cached_blocks--;
+		stl->cache_wr_replace++;
 	}
 
 	ci->state = INPROG;
 	ci->dbn = bio->bi_iter.bi_sector;
-	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
 
-	job = alloc_kcached_job(dmc, bio, index);
+	spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
+
+	job = alloc_dmio_job(stl, bio, index);
 	if (likely(job)) {
-		job->rw = WRITESOURCE;
-		atomic_inc(&job->dmc->nr_jobs);
-		dmc->disk_writes++;
+		job->type = WRITE_BACKINGDEV;
+		atomic_inc(&job->stl->nr_jobs);
+		stl->disk_writes++;
 
-		dm_io_async_bvec(&job->disk, WRITE, bio, rc_io_callback, job);
+		dm_io_async_bvec(&job->disk, WRITE, bio, dmio_done, job);
 	}
 }
 
 #define bio_barrier(bio)		((bio)->bi_opf & REQ_PREFLUSH)
 
 static int
-rc_map(struct dm_target *ti, struct bio *bio)
+stolearn_map(struct dm_target *ti, struct bio *bio)
 {
-	struct cache_context	*dmc = (struct cache_context *)ti->private;
+	stolearn_t	*stl = (stolearn_t *)ti->private;
 
 	if (bio_barrier(bio))
 		return -EOPNOTSUPP;
 
-	ASSERT(to_sector(bio->bi_iter.bi_size) <= dmc->block_size);
+	ASSERT(to_sector(bio->bi_iter.bi_size) <= stl->block_size);
 	if (bio_data_dir(bio) == READ)
-		dmc->reads++;
+		stl->reads++;
 	else
-		dmc->writes++;
+		stl->writes++;
 
 	if (bio_data_dir(bio) == READ)
-		cache_read(dmc, bio);
+		cache_read(stl, bio);
 	else
-		cache_write(dmc, bio);
+		cache_write(stl, bio);
 	return DM_MAPIO_SUBMITTED;
 }
 
 static inline int
-rc_get_dev(struct dm_target *ti, char *pth, struct dm_dev **dmd, char *dmc_dname, sector_t tilen)
+rc_get_dev(struct dm_target *ti, char *pth, struct dm_dev **dmd, char *stl_dname, sector_t tilen)
 {
 	int	rc;
 
 	rc = dm_get_device(ti, pth, dm_table_get_mode(ti->table), dmd);
 	if (!rc)
-		strncpy(dmc_dname, pth, DEV_PATHLEN);
+		strncpy(stl_dname, pth, DEV_PATHLEN);
 	return rc;
 }
 
@@ -614,258 +591,282 @@ get_max_sectors_by_mem(void)
 	return (si.totalram * PAGE_SIZE / SECTOR_SIZE / 4);
 }
 
+static unsigned long
+convert_sectors_to_blocks(stolearn_t *stl, unsigned long sectors)
+{
+	unsigned	tmpsize;
+
+	do_div(sectors, stl->block_size);
+	tmpsize = sectors;
+	do_div(tmpsize, stl->assoc);
+	return tmpsize * stl->assoc;
+}
+
+static void
+init_stolearn(stolearn_t *stl)
+{
+	sector_t	max_sectors_bymem;
+	unsigned int	consecutive_blocks;
+
+	init_waitqueue_head(&stl->destroyq);
+	atomic_set(&stl->nr_jobs, 0);
+
+	init_waitqueue_head(&stl->inprogq);
+	stl->block_size = CACHE_BLOCK_SIZE;
+	stl->block_shift = ffs(stl->block_size) - 1;
+
+	stl->size_nominal = to_sector(stl->cache_dev->bdev->bd_inode->i_size);
+	stl->size = stl->size_nominal;
+	max_sectors_bymem = get_max_sectors_by_mem();
+	if (stl->size > max_sectors_bymem)
+		stl->size = max_sectors_bymem;
+
+	spin_lock_init(&stl->cache_spin_lock);
+
+	stl->size = convert_sectors_to_blocks(stl, stl->size);
+	stl->size_nominal = convert_sectors_to_blocks(stl, stl->size_nominal);
+
+	consecutive_blocks = stl->assoc;
+	stl->consecutive_shift = ffs(consecutive_blocks) - 1;
+
+	stl->reads = 0;
+	stl->writes = 0;
+	stl->cache_hits = 0;
+	stl->replace = 0;
+	stl->cached_blocks = 0;
+	stl->cache_wr_replace = 0;
+}
+
+static void
+init_caches(stolearn_t *stl)
+{
+	cacheinfo_t	*ci;
+	int	i;
+
+	for (i = 0, ci = stl->cacheinfos; i < stl->size; i++, ci++) {
+		ci->dbn = 0;
+		ci->n_readers = 0;
+		ci->state = INVALID;
+	}
+
+	/* Initialize the point where LRU sweeps begin for each set */
+	for (i = 0; i < (stl->size >> stl->consecutive_shift); i++)
+		stl->set_lru_next[i] = i * stl->assoc;
+}
+
+static void
+free_stolearn(stolearn_t *stl)
+{
+	if (stl->pcache)
+		pcache_delete(stl->pcache);
+	if (stl->io_client)
+		dm_io_client_destroy(stl->io_client);
+	if (stl->cacheinfos)
+		vfree(stl->cacheinfos);
+	if (stl->set_lru_next)
+		vfree(stl->set_lru_next);
+
+	if (stl->disk_dev)
+		dm_put_device(stl->tgt, stl->disk_dev);
+	if (stl->cache_dev)
+		dm_put_device(stl->tgt, stl->cache_dev);
+	kfree(stl);
+}
+
 /* Construct a cache mapping.
  *  arg[0]: path to source device
  *  arg[1]: path to cache device
  *  arg[2]: pcache size in MB
  *  arg[3]: cache associativity */
-static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+static int
+stolearn_ctr(struct dm_target *tgt, unsigned int argc, char **argv)
 {
-	struct cache_context *dmc;
-	unsigned int consecutive_blocks;
-	sector_t i, order, tmpsize;
-	sector_t max_sectors_bymem;
-	int r = -EINVAL;
+	stolearn_t	*stl;
+	int	err;
 
 	if (argc < 2) {
-		ti->error = "stolearn-cache: Need at least 2 arguments";
-		goto construct_fail;
+		tgt->error = "stolearn-cache: at least 2 arguments are required";
+		return -EINVAL;
 	}
 
-	dmc = kzalloc(sizeof(*dmc), GFP_KERNEL);
-	if (!dmc) {
-		ti->error = "stolearn-cache: Failed to allocate cache context";
-		r = -ENOMEM;
-		goto construct_fail;
+	stl = kzalloc(sizeof(*stl), GFP_KERNEL);
+	if (stl == NULL) {
+		tgt->error = "stolearn-cache: failed to allocate stolearn object";
+		return -ENOMEM;
+	}
+	stl->tgt = tgt;
+
+	if (rc_get_dev(tgt, argv[0], &stl->disk_dev, stl->disk_devname, tgt->len)) {
+		tgt->error = "stolearn-cache: failed to lookup backing device";
+		kfree(stl);
+		return -EINVAL;
+	}
+	if (rc_get_dev(tgt, argv[1], &stl->cache_dev, stl->cache_devname, 0)) {
+		tgt->error = "stolearn-cache: failed to lookup caching device";
+		free_stolearn(stl);
+		return -EINVAL;
 	}
 
-	dmc->tgt = ti;
-
-	if (rc_get_dev(ti, argv[0], &dmc->disk_dev,
-	    dmc->disk_devname, ti->len)) {
-		ti->error = "stolearn-cache: Disk device lookup failed";
-		goto construct_fail1;
-	}
-	if (rc_get_dev(ti, argv[1], &dmc->cache_dev, dmc->cache_devname, 0)) {
-		ti->error = "stolearn-cache: Cache device lookup failed";
-		goto construct_fail2;
-	}
-
-	dmc->io_client = dm_io_client_create();
-	if (IS_ERR(dmc->io_client)) {
-		r = PTR_ERR(dmc->io_client);
-		ti->error = "Failed to create io client\n";
-		goto construct_fail3;
-	}
-
-	r = kcached_init(dmc);
-	if (r) {
-		ti->error = "Failed to initialize kcached";
-		goto construct_fail4;
-	}
-	dmc->block_size = CACHE_BLOCK_SIZE;
-	dmc->block_shift = ffs(dmc->block_size) - 1;
-	dmc->block_mask = dmc->block_size - 1;
-
-	dmc->size_nominal = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
-	dmc->size = dmc->size_nominal;
-	max_sectors_bymem = get_max_sectors_by_mem();
-	if (dmc->size > max_sectors_bymem)
-		dmc->size = max_sectors_bymem;
 	if (argc >= 3) {
 		unsigned int    size_in_MB;
 
 		if (kstrtouint(argv[2], 0, &size_in_MB)) {
-			ti->error = "stolearn-cache: invalid size format";
-			r = -EINVAL;
-			goto construct_fail5;
+			tgt->error = "stolearn-cache: invalid size format";
+			free_stolearn(stl);
+			return -EINVAL;
 		}
-		dmc->size = to_sector(size_in_MB * 1024 * 1024);
+		stl->size = to_sector(size_in_MB * 1024 * 1024);
 	}
 
 	if (argc >= 4) {
-		if (kstrtoint(argv[3], 10, &dmc->assoc)) {
-			ti->error = "stolearn-cache: Invalid cache associativity";
-			r = -EINVAL;
-			goto construct_fail5;
+		if (kstrtoint(argv[3], 10, &stl->assoc)) {
+			tgt->error = "stolearn-cache: invalid cache associativity format";
+			free_stolearn(stl);
+			return -EINVAL;
 		}
-		if (!dmc->assoc || (dmc->assoc & (dmc->assoc - 1)) ||
-		    dmc->size < dmc->assoc) {
-			ti->error = "stolearn-cache: Invalid cache associativity";
-			r = -EINVAL;
-			goto construct_fail5;
+		if (!stl->assoc || (stl->assoc & (stl->assoc - 1)) || stl->size < stl->assoc) {
+			tgt->error = "stolearn-cache: inconsistent cache associativity";
+			free_stolearn(stl);
+			return -EINVAL;
 		}
 	} else {
-		dmc->assoc = DEFAULT_CACHE_ASSOC;
+		stl->assoc = DEFAULT_CACHE_ASSOC;
 	}
 
-	/* Convert size (in sectors) to blocks. Then round size
-	 * (in blocks now) down to a multiple of associativity */
-	do_div(dmc->size, dmc->block_size);
-	tmpsize = dmc->size;
-	do_div(tmpsize, dmc->assoc);
-	dmc->size = tmpsize * dmc->assoc;
+	stl->io_client = dm_io_client_create();
+	if (IS_ERR(stl->io_client)) {
+		err = PTR_ERR(stl->io_client);
 
-	do_div(dmc->size_nominal, dmc->block_size);
-	tmpsize = dmc->size_nominal;
-	do_div(tmpsize, dmc->assoc);
-	dmc->size_nominal = tmpsize * dmc->assoc;
+		tgt->error = "failed to create io client\n";
+		free_stolearn(stl);
+		return err;
+	}
 
-	consecutive_blocks = dmc->assoc;
-	dmc->consecutive_shift = ffs(consecutive_blocks) - 1;
+	stl->pcache = pcache_create();
+	if (stl->pcache == NULL) {
+		tgt->error = "failed to create pcache\n";
+		free_stolearn(stl);
+		return -ENOMEM;
+	}
+
+	init_stolearn(stl);
 
 	DMINFO("allocate %lu-entry cache"
 	       "(capacity:%luKB, associativity:%u, block size:%u sectors(%uKB))",
-	       dmc->size_nominal, (unsigned long)((dmc->size_nominal * sizeof(cacheinfo_t)) >> 10),
-	       dmc->assoc, dmc->block_size, dmc->block_size >> (10 - SECTOR_SHIFT));
-	dmc->cacheinfos = vmalloc(dmc->size * sizeof(cacheinfo_t));
-	if (dmc->cacheinfos == NULL)
-		goto construct_fail6;
+	       stl->size_nominal, (unsigned long)((stl->size_nominal * sizeof(cacheinfo_t)) >> 10),
+	       stl->assoc, stl->block_size, stl->block_size >> (10 - SECTOR_SHIFT));
 
-	order = (dmc->size >> dmc->consecutive_shift) * sizeof(u32);
-	dmc->set_lru_next = vmalloc(order);
-	if (!dmc->set_lru_next)
-		goto construct_fail7;
-
-	for (i = 0; i < dmc->size; i++) {
-		dmc->cacheinfos[i].dbn = 0;
-		dmc->cacheinfos[i].n_readers = 0;
-		dmc->cacheinfos[i].state = INVALID;
+	stl->cacheinfos = vmalloc(stl->size * sizeof(cacheinfo_t));
+	if (stl->cacheinfos == NULL) {
+		tgt->error = "failed to allocate cacheinfos\n";
+		free_stolearn(stl);
+		return -ENOMEM;
 	}
 
-	/* Initialize the point where LRU sweeps begin for each set */
-	for (i = 0; i < (dmc->size >> dmc->consecutive_shift); i++)
-		dmc->set_lru_next[i] = i * dmc->assoc;
+	stl->set_lru_next = vmalloc((stl->size >> stl->consecutive_shift) * sizeof(u32));
+	if (stl->set_lru_next == NULL) {
+		tgt->error = "failed to allocate set_lru_next\n";
+		free_stolearn(stl);
+		return -ENOMEM;
+	}
 
-	spin_lock_init(&dmc->cache_spin_lock);
+	init_caches(stl);
 
-	dmc->reads = 0;
-	dmc->writes = 0;
-	dmc->cache_hits = 0;
-	dmc->replace = 0;
-	dmc->wr_invalidates = 0;
-	dmc->rd_invalidates = 0;
-	dmc->cached_blocks = 0;
-	dmc->cache_wr_replace = 0;
+	err = dm_set_target_max_io_len(tgt, stl->block_size);
+	if (err) {
+		tgt->error = "failed to set max io length\n";
+		free_stolearn(stl);
+		return err;
+	}
 
-	r = dm_set_target_max_io_len(ti, dmc->block_size);
-	if (r)
-		goto construct_fail7;
-	ti->private = dmc;
-
-	dmc->pcache = pcache_create();
+	tgt->private = stl;
 
 	return 0;
-
-construct_fail7:
-	vfree(dmc->cacheinfos);
-construct_fail6:
-	r = -ENOMEM;
-	ti->error = "Unable to allocate memory";
-construct_fail5:
-	kcached_client_destroy(dmc);
-construct_fail4:
-	dm_io_client_destroy(dmc->io_client);
-construct_fail3:
-	dm_put_device(ti, dmc->cache_dev);
-construct_fail2:
-	dm_put_device(ti, dmc->disk_dev);
-construct_fail1:
-	kfree(dmc);
-construct_fail:
-	return r;
-}
-
-static void cache_dtr(struct dm_target *ti)
-{
-	struct cache_context *dmc = (struct cache_context *) ti->private;
-
-	kcached_client_destroy(dmc);
-
-	if (dmc->reads + dmc->writes > 0) {
-		DMINFO("stats:\n\treads(%lu), writes(%lu)\n",
-		       dmc->reads, dmc->writes);
-		DMINFO("\tcache hits(%lu), replacement(%lu), write replacement(%lu)\n"
-			"\tread invalidates(%lu), write invalidates(%lu)\n",
-			dmc->cache_hits, dmc->replace, dmc->cache_wr_replace,
-			dmc->rd_invalidates, dmc->wr_invalidates);
-		DMINFO("conf:\n\tcapacity(%luM), associativity(%u), block size(%uK)\n"
-		       "\ttotal blocks(%lu)\n",
-		       (unsigned long)dmc->size_nominal * dmc->block_size >> 11,
-		       dmc->assoc, dmc->block_size >> (10 - SECTOR_SHIFT),
-		       (unsigned long)dmc->size_nominal);
-	}
-
-	pcache_delete(dmc->pcache);
-
-	dm_io_client_destroy(dmc->io_client);
-	vfree(dmc->cacheinfos);
-	vfree(dmc->set_lru_next);
-
-	dm_put_device(ti, dmc->disk_dev);
-	dm_put_device(ti, dmc->cache_dev);
-	kfree(dmc);
-}
-
-static void rc_status_info(struct cache_context *dmc, status_type_t type,
-			    char *result, unsigned int maxlen)
-{
-	int sz = 0;
-
-	DMEMIT("stats:\n\treads(%lu), writes(%lu)\n", dmc->reads, dmc->writes);
-	DMEMIT("\tcache hits(%lu), replacement(%lu), write replacement(%lu)\n"
-		"\tread invalidates(%lu), write invalidates(%lu)\n"
-		"\tuncached reads(%lu), uncached writes(%lu)\n"
-		"\tdisk reads(%lu), disk writes(%lu)\n"
-		"\tcache reads(%lu), cache writes(%lu)\n",
-		dmc->cache_hits, dmc->replace, dmc->cache_wr_replace,
-		dmc->rd_invalidates, dmc->wr_invalidates,
-		dmc->uncached_reads, dmc->uncached_writes,
-		dmc->disk_reads, dmc->disk_writes,
-		dmc->cache_reads, dmc->cache_writes);
-}
-
-static void rc_status_table(struct cache_context *dmc, status_type_t type,
-			     char *result, unsigned int maxlen)
-{
-	int sz = 0;
-
-	DMEMIT("conf:\n\tStolearn-NN dev (%s), disk dev (%s)"
-	       "\tcapacity(%luM), associativity(%u), block size(%uK)\n"
-	       "\ttotal blocks(%lu)\n",
-	       dmc->cache_devname, dmc->disk_devname,
-	       (unsigned long)dmc->size_nominal * dmc->block_size >> 11, dmc->assoc,
-	       dmc->block_size >> (10 - SECTOR_SHIFT),
-	       (unsigned long)dmc->size_nominal);
 }
 
 static void
-cache_status(struct dm_target *ti, status_type_t type, unsigned status_flags,
-	     char *result, unsigned int maxlen)
+stolearn_dtr(struct dm_target *ti)
 {
-	struct cache_context *dmc = (struct cache_context *)ti->private;
+	stolearn_t	*stl = (stolearn_t *) ti->private;
+
+	wait_event(stl->destroyq, !atomic_read(&stl->nr_jobs));
+
+	if (stl->reads + stl->writes > 0) {
+		DMINFO("stats:\n\treads(%lu), writes(%lu)\n",
+		       stl->reads, stl->writes);
+		DMINFO("\tcache hits(%lu), replacement(%lu), write replacement(%lu)\n",
+		       stl->cache_hits, stl->replace, stl->cache_wr_replace);
+		DMINFO("conf:\n\tcapacity(%luM), associativity(%u), block size(%uK)\n"
+		       "\ttotal blocks(%lu)\n",
+		       (unsigned long)stl->size_nominal * stl->block_size >> 11,
+		       stl->assoc, stl->block_size >> (10 - SECTOR_SHIFT),
+		       (unsigned long)stl->size_nominal);
+	}
+
+	pcache_delete(stl->pcache);
+
+	dm_io_client_destroy(stl->io_client);
+	vfree(stl->cacheinfos);
+	vfree(stl->set_lru_next);
+
+	dm_put_device(ti, stl->disk_dev);
+	dm_put_device(ti, stl->cache_dev);
+	kfree(stl);
+}
+
+static void
+stolearn_status_info(stolearn_t *stl, status_type_t type, char *result, unsigned int maxlen)
+{
+	int	sz = 0;
+	DMEMIT("stats:\n\treads(%lu), writes(%lu)\n", stl->reads, stl->writes);
+	DMEMIT("\tcache hits(%lu), replacement(%lu), write replacement(%lu)\n"
+		"\tdisk reads(%lu), disk writes(%lu)\n"
+		"\tcache reads(%lu), cache writes(%lu)\n",
+		stl->cache_hits, stl->replace, stl->cache_wr_replace,
+		stl->disk_reads, stl->disk_writes,
+		stl->cache_reads, stl->cache_writes);
+}
+
+static void
+stolearn_status_table(stolearn_t *stl, status_type_t type, char *result, unsigned int maxlen)
+{
+	int	sz = 0;
+	DMEMIT("conf:\n\tStolearn-NN dev (%s), disk dev (%s)"
+	       "\tcapacity(%luM), associativity(%u), block size(%uK)\n"
+	       "\ttotal blocks(%lu)\n",
+	       stl->cache_devname, stl->disk_devname,
+	       (unsigned long)stl->size_nominal * stl->block_size >> 11, stl->assoc,
+	       stl->block_size >> (10 - SECTOR_SHIFT),
+	       (unsigned long)stl->size_nominal);
+}
+
+static void
+stolearn_status(struct dm_target *ti, status_type_t type, unsigned status_flags, char *result, unsigned int maxlen)
+{
+	stolearn_t	*stl = (stolearn_t *)ti->private;
 
 	switch (type) {
 	case STATUSTYPE_INFO:
-		rc_status_info(dmc, type, result, maxlen);
+		stolearn_status_info(stl, type, result, maxlen);
 		break;
 	case STATUSTYPE_TABLE:
-		rc_status_table(dmc, type, result, maxlen);
+		stolearn_status_table(stl, type, result, maxlen);
 		break;
 	}
 }
 
-static struct target_type cache_target = {
+static struct target_type stolearn_target = {
 	.name    = "stolearn-cache",
 	.version = {1, 0, 0},
 	.module  = THIS_MODULE,
-	.ctr	 = cache_ctr,
-	.dtr	 = cache_dtr,
-	.map	 = rc_map,
-	.status  = cache_status,
+	.ctr	 = stolearn_ctr,
+	.dtr	 = stolearn_dtr,
+	.map	 = stolearn_map,
+	.status  = stolearn_status,
 };
 
-int __init rc_init(void)
+int __init
+rc_init(void)
 {
 	int ret;
 
@@ -873,15 +874,16 @@ int __init rc_init(void)
 	if (ret)
 		return ret;
 
-	ret = dm_register_target(&cache_target);
+	ret = dm_register_target(&stolearn_target);
 	if (ret < 0)
 		return ret;
 	return 0;
 }
 
-void rc_exit(void)
+void
+rc_exit(void)
 {
-	dm_unregister_target(&cache_target);
+	dm_unregister_target(&stolearn_target);
 	jobs_exit();
 }
 
@@ -893,4 +895,3 @@ MODULE_AUTHOR("oslab <oslab@oslab.ewha.ac.kr>");
 MODULE_DESCRIPTION("Stolearn-Cache is a machine learning based caching target with NN model.");
 MODULE_VERSION(VERSION_STR);
 MODULE_INFO(Copyright, "Copyleft 2021 OSLAB, Ewha");
-MODULE_SOFTDEP("pre: stolearn_nn");
