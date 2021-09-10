@@ -406,6 +406,37 @@ out:
 	return err;
 }
 
+int
+rdsk_submit_bio(struct gendisk *disk, sector_t sector, struct bio *bio)
+{
+	struct rdsk_device *rdsk = disk->private_data;
+	struct bio_vec bvec;
+	struct bvec_iter iter;
+
+	if (unlikely(bio_op(bio) == REQ_OP_DISCARD)) {
+		if (sector & ((PAGE_SIZE >> SECTOR_SHIFT) - 1) ||
+		    bio->bi_iter.bi_size & ~PAGE_MASK)
+			return -EIO;
+		discard_from_rdsk(rdsk, sector, bio->bi_iter.bi_size);
+		return 0;
+	}
+
+	bio_for_each_segment(bvec, bio, iter) {
+		unsigned int len = bvec.bv_len;
+		int	err;
+
+		err = rdsk_do_bvec(rdsk, bvec.bv_page, len,
+				   bvec.bv_offset, op_is_write(bio_op(bio)), sector);
+		if (err) {
+			rdsk->error_cnt++;
+			return -EIO;
+		}
+		sector += len >> SECTOR_SHIFT;
+	}
+	return 0;
+}
+EXPORT_SYMBOL(rdsk_submit_bio);
+
 static blk_qc_t
 rdsk_make_request(struct request_queue *q, struct bio *bio)
 {

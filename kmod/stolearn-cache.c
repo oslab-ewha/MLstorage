@@ -160,22 +160,17 @@ static int cache_invalidate_blocks(struct cache_context *, struct bio *);
 static void rc_uncached_io_callback(unsigned long, void *);
 static void rc_start_uncached_io(struct cache_context *, struct bio *);
 
-int dm_io_async_bvec(unsigned int num_regions, struct dm_io_region *where,
-		     int rw, struct bio *bio, io_notify_fn fn, void *context)
+int rdsk_submit_bio(struct gendisk *disk, sector_t sector, struct bio *bio);
+static void rc_io_callback(unsigned long error, void *context);
+
+static void
+dm_io_async_bvec(struct dm_io_region *where, struct bio *bio, io_notify_fn fn, struct kcached_job *job)
 {
-	struct kcached_job *job = (struct kcached_job *)context;
 	struct cache_context *dmc = job->dmc;
-	struct dm_io_request iorq;
+	int	err;
 
-	iorq.bi_op = rw;
-	iorq.bi_op_flags = 0;
-	iorq.mem.type = DM_IO_BIO;
-	iorq.mem.ptr.bio = bio;
-	iorq.notify.fn = fn;
-	iorq.notify.context = context;
-	iorq.client = dmc->io_client;
-
-	return dm_io(&iorq, num_regions, where, NULL);
+	err = rdsk_submit_bio(dmc->cache_dev->bdev->bd_disk, where->sector, bio);
+	fn(err, job);
 }
 
 static int jobs_init(void)
@@ -230,7 +225,8 @@ static inline void push(struct list_head *jobs, struct kcached_job *job)
 	spin_unlock_irqrestore(&job_lock, flags);
 }
 
-void rc_io_callback(unsigned long error, void *context)
+static void
+rc_io_callback(unsigned long error, void *context)
 {
 	struct kcached_job *job = (struct kcached_job *)context;
 	struct cache_context *dmc = job->dmc;
@@ -310,15 +306,13 @@ EXPORT_SYMBOL(rc_io_callback);
 
 static int do_io(struct kcached_job *job)
 {
-	int r = 0;
 	struct cache_context *dmc = job->dmc;
 	struct bio *bio = job->bio;
 
 	ASSERT(job->rw == WRITECACHE);
 	dmc->cache_writes++;
-	r = dm_io_async_bvec(1, &job->cache, WRITE, bio, rc_io_callback, job);
-	ASSERT(r == 0); /* dm_io_async_bvec() must always return 0 */
-	return r;
+	dm_io_async_bvec(&job->cache, bio, rc_io_callback, job);
+	return 0;
 }
 
 int rc_do_complete(struct kcached_job *job)
@@ -522,8 +516,7 @@ static void cache_read_miss(struct cache_context *dmc,
 		job->rw = READSOURCE;
 		atomic_inc(&dmc->nr_jobs);
 		dmc->disk_reads++;
-		dm_io_async_bvec(1, &job->disk, READ,
-				 bio, rc_io_callback, job);
+		dm_io_async_bvec(&job->disk, bio, rc_io_callback, job);
 	}
 }
 
@@ -554,8 +547,7 @@ static void cache_read(struct cache_context *dmc, struct bio *bio)
 			job->rw = READCACHE;
 			atomic_inc(&dmc->nr_jobs);
 			dmc->cache_reads++;
-			dm_io_async_bvec(1, &job->cache, READ, bio,
-					 rc_io_callback, job);
+			dm_io_async_bvec(&job->cache, bio, rc_io_callback, job);
 		}
 		return;
 	}
@@ -682,7 +674,7 @@ static void cache_write(struct cache_context *dmc, struct bio *bio)
 	job->rw = WRITESOURCE;
 	atomic_inc(&job->dmc->nr_jobs);
 	dmc->disk_writes++;
-	dm_io_async_bvec(1, &job->disk, WRITE, bio, rc_io_callback, job);
+	dm_io_async_bvec(&job->disk, bio, rc_io_callback, job);
 }
 
 #define bio_barrier(bio)		((bio)->bi_opf & REQ_PREFLUSH)
@@ -744,7 +736,6 @@ static void rc_uncached_io_callback(unsigned long error, void *context)
 
 static void rc_start_uncached_io(struct cache_context *dmc, struct bio *bio)
 {
-	int is_write = (bio_data_dir(bio) == WRITE);
 	struct kcached_job *job;
 
 	job = new_kcached_job(dmc, bio, -1);
@@ -758,8 +749,7 @@ static void rc_start_uncached_io(struct cache_context *dmc, struct bio *bio)
 		dmc->disk_reads++;
 	else
 		dmc->disk_writes++;
-	dm_io_async_bvec(1, &job->disk, ((is_write) ? WRITE : READ),
-			 bio, rc_uncached_io_callback, job);
+	dm_io_async_bvec(&job->disk, bio, rc_uncached_io_callback, job);
 }
 
 static inline int rc_get_dev(struct dm_target *ti, char *pth,
