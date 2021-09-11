@@ -85,10 +85,14 @@
 #define WT_MIN_JOBS	1024
 /* Number of pages for I/O */
 
+typedef unsigned long	bno_t;
+
+#define SECTOR_TO_BNO(stl, sector)	((sector) >> (stl)->block_shift)
+
 /* Cache block metadata structure */
 #pragma pack(push, 1)
 typedef struct _cacheinfo {
-	sector_t dbn;		/* Sector number of the cached block */
+	bno_t	bno;		/* block number, index of the cached block */
 	u16	n_readers;
 	int	state:16;
 } cacheinfo_t;
@@ -103,7 +107,7 @@ typedef struct _stolearn {
 
 	spinlock_t	cache_spin_lock;
 	cacheinfo_t	*cacheinfos;
-	u32	*set_lru_next;
+	bno_t	*set_lru_next;
 
 	struct dm_io_client	*io_client;
 	unsigned long	size, size_nominal;
@@ -135,7 +139,7 @@ typedef struct _dmio_job {
 	stolearn_t	*stl;
 	struct bio	*bio;	/* Original bio */
 	struct dm_io_region	disk;
-	int	index;
+	bno_t	bno;
 	int	type;
 	int	error;
 } dmio_job_t;
@@ -195,14 +199,14 @@ job_free(dmio_job_t *job)
 }
 
 static void
-copy_bio_to_pcache(stolearn_t *stl, struct bio *bio, int index)
+copy_bio_to_pcache(stolearn_t *stl, struct bio *bio, bno_t bno)
 {
-	cacheinfo_t	*ci = stl->cacheinfos + index;
+	cacheinfo_t	*ci = stl->cacheinfos + bno;
 	unsigned long	flags;
 	int	err;
 
 	if (to_sector(bio->bi_iter.bi_size) == stl->block_size) {
-		sector_t	sector = index << stl->block_shift;
+		sector_t	sector = bno << stl->block_shift;
 		int	err;
 
 		stl->cache_writes++;
@@ -234,8 +238,8 @@ dmio_done(unsigned long err, void *context)
 {
 	dmio_job_t	*job = (dmio_job_t *)context;
 	stolearn_t	*stl = job->stl;
-	int	index = job->index;
-	cacheinfo_t	*ci = stl->cacheinfos + index;
+	bno_t		bno = job->bno;
+	cacheinfo_t	*ci = stl->cacheinfos + bno;
 	struct bio	*bio;
 	unsigned long	flags;
 
@@ -259,34 +263,34 @@ dmio_done(unsigned long err, void *context)
 	else {
 		spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 		job_free(job);
-		copy_bio_to_pcache(stl, bio, index);
+		copy_bio_to_pcache(stl, bio, bno);
 	}
 }
 
 static unsigned long
-hash_block(stolearn_t *stl, sector_t dbn)
+hash_block(stolearn_t *stl, bno_t bno)
 {
 	unsigned long	set_number;
 	uint64_t	value;
 
-	value = (dbn >> (stl->block_shift + stl->consecutive_shift));
+	value = bno >> stl->consecutive_shift;
 	set_number = do_div(value, (stl->size >> stl->consecutive_shift));
 	return set_number;
 }
 
 static bool
-find_valid_dbn(stolearn_t *stl, sector_t dbn, int start_index, int *pindex, unsigned long *pflags)
+find_valid_blk(stolearn_t *stl, bno_t bno, bno_t bno_start, bno_t *pbno, unsigned long *pflags)
 {
 	cacheinfo_t	*ci;
-	int	end_index = start_index + stl->assoc;
-	int	i;
+	bno_t	bno_end = bno_start + stl->assoc;
+	bno_t	i;
 
 again:
-	for (i = start_index, ci = stl->cacheinfos + start_index; i < end_index; i++, ci++) {
-		if (dbn == ci->dbn) {
+	for (i = bno_start, ci = stl->cacheinfos + bno_start; i < bno_end; i++, ci++) {
+		if (bno == ci->bno) {
 			switch (ci->state) {
 			case VALID:
-				*pindex = i;
+				*pbno = i;
 				return true;
 			case INPROG:
 				spin_unlock_irqrestore(&stl->cache_spin_lock, *pflags);
@@ -302,16 +306,15 @@ again:
 }
 
 static bool
-find_invalid_dbn(stolearn_t *stl, int start_index, int *pindex)
+find_invalid_blk(stolearn_t *stl, bno_t bno_start, bno_t *pbno)
 {
-	int	end_index = start_index + stl->assoc;
-	int	i;
+	bno_t	bno_end = bno_start + stl->assoc;
+	bno_t	i;
 
 	/* Find INVALID slot that we can reuse */
-	for (i = start_index; i < end_index; i++) {
+	for (i = bno_start; i < bno_end; i++) {
 		if (stl->cacheinfos[i].state == INVALID) {
-			if (pindex)
-				*pindex = i;
+			*pbno = i;
 			return true;
 		}
 	}
@@ -319,13 +322,13 @@ find_invalid_dbn(stolearn_t *stl, int start_index, int *pindex)
 }
 
 static bool
-has_nonprog_dbn(stolearn_t *stl, int start_index)
+has_nonprog_dbn(stolearn_t *stl, bno_t bno_start)
 {
-	int	end_index = start_index + stl->assoc;
-	int	i;
+	bno_t	bno_end = bno_start + stl->assoc;
+	bno_t	i;
 
 	/* Find INVALID slot that we can reuse */
-	for (i = start_index; i < end_index; i++) {
+	for (i = bno_start; i < bno_end; i++) {
 		if (stl->cacheinfos[i].state != INPROG) {
 			return true;
 		}
@@ -333,72 +336,72 @@ has_nonprog_dbn(stolearn_t *stl, int start_index)
 	return false;
 }
 
-#define NEXT_INDEX(index, start_index, end_index) \
-	((index) + 1 == (end_index)) ? (start_index): ((index) + 1)
+#define NEXT_BNO(bno, bno_start, bno_end) \
+	((bno) + 1 == (bno_end)) ? (bno_start): ((bno) + 1)
 
 static bool
-find_reclaim_dbn(stolearn_t *stl, int start_index, int *pindex_reclaimed)
+find_reclaim_blk(stolearn_t *stl, bno_t bno_start, bno_t *pbno_reclaimed)
 {
-	int	end_index = start_index + stl->assoc;
-	int	set = start_index / stl->assoc;
+	bno_t	bno_end = bno_start + stl->assoc;
+	int	set = bno_start / stl->assoc;
 	int	slots_searched = 0;
-	int	index;
+	bno_t	bno_lru;
 
 	/* Find the "oldest" VALID slot to recycle. For each set, we keep
 	 * track of the next "lru" slot to pick off. Each time we pick off
 	 * a VALID entry to recycle we advance this pointer. So  we sweep
 	 * through the set looking for next blocks to recycle. This
 	 * approximates to FIFO (modulo for blocks written through). */
-	index = stl->set_lru_next[set];
+	bno_lru = stl->set_lru_next[set];
 	while (slots_searched < stl->assoc) {
-		ASSERT(index >= start_index && index < end_index);
+		ASSERT(bno_lru >= bno_start && bno_lru < bno_end);
 
-		if (IS_VALID_CACHE_STATE(stl->cacheinfos[index].state)) {
-			*pindex_reclaimed = index;
-			stl->set_lru_next[set] = NEXT_INDEX(index, start_index, end_index);
+		if (IS_VALID_CACHE_STATE(stl->cacheinfos[bno_lru].state)) {
+			*pbno_reclaimed = bno_lru;
+			stl->set_lru_next[set] = NEXT_BNO(bno_lru, bno_start, bno_end);
 			return true;
 		}
 		slots_searched++;
-		index = NEXT_INDEX(index, start_index, end_index);
+		bno_lru = NEXT_BNO(bno_lru, bno_start, bno_end);
 	}
 	return false;
 }
 
 /* dbn is the starting sector, io_size is the number of sectors. */
 static bool
-cache_lookup(stolearn_t *stl, struct bio *bio, int *pindex, unsigned long *pflags)
+cache_lookup(stolearn_t *stl, struct bio *bio, bno_t *pbno, unsigned long *pflags)
 {
-	sector_t dbn = bio->bi_iter.bi_sector;
-	unsigned long	set_number = hash_block(stl, dbn);
-	int	index_invalid;
-	int	start_index;
+	bno_t	bno = SECTOR_TO_BNO(stl, bio->bi_iter.bi_sector);
+	unsigned long	set_number = hash_block(stl, bno);
+	bno_t	bno_invalid;
+	bno_t	bno_start;
 
-	start_index = stl->assoc * set_number;
+	bno_start = stl->assoc * set_number;
 
 again:
-	if (find_valid_dbn(stl, dbn, start_index, pindex, pflags))
+	if (find_valid_blk(stl, bno, bno_start, pbno, pflags))
 		return true;
 
-	if (find_invalid_dbn(stl, start_index, &index_invalid))
-		*pindex = index_invalid;
+	if (find_invalid_blk(stl, bno_start, &bno_invalid))
+		*pbno = bno_invalid;
 	else {
-		int	index_reclaimed;
+		bno_t	bno_reclaimed;
 
 		/* We didn't find an invalid entry, search for oldest valid entry */
-		if (!find_reclaim_dbn(stl, start_index, &index_reclaimed)) {
+		if (!find_reclaim_blk(stl, bno_start, &bno_reclaimed)) {
 			spin_unlock_irqrestore(&stl->cache_spin_lock, *pflags);
-			wait_event(stl->inprogq, has_nonprog_dbn(stl, start_index));
+			wait_event(stl->inprogq, has_nonprog_dbn(stl, bno_start));
 			spin_lock_irqsave(&stl->cache_spin_lock, *pflags);
 			goto again;
 		}
-		*pindex = index_reclaimed;
+		*pbno = bno_reclaimed;
 	}
 
-	return INVALID;
+	return false;
 }
 
 static dmio_job_t *
-new_dmio_job(stolearn_t *stl, struct bio *bio, int index)
+new_dmio_job(stolearn_t *stl, struct bio *bio, bno_t bno)
 {
 	dmio_job_t	*job;
 
@@ -411,25 +414,25 @@ new_dmio_job(stolearn_t *stl, struct bio *bio, int index)
 	job->disk.count = to_sector(bio->bi_iter.bi_size);
 	job->stl = stl;
 	job->bio = bio;
-	job->index = index;
+	job->bno = bno;
 	job->error = 0;
 
 	return job;
 }
 
 static dmio_job_t *
-alloc_dmio_job(stolearn_t *stl, struct bio *bio, int index)
+alloc_dmio_job(stolearn_t *stl, struct bio *bio, bno_t bno)
 {
 	dmio_job_t *job;
 
-	job = new_dmio_job(stl, bio, index);
+	job = new_dmio_job(stl, bio, bno);
 	if (unlikely(!job)) {
 		unsigned long	flags;
 
 		DMERR("failed to allocate job\n");
 
 		spin_lock_irqsave(&stl->cache_spin_lock, flags);
-		stl->cacheinfos[index].state = INVALID;
+		stl->cacheinfos[bno].state = INVALID;
 		spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 
 		bio->bi_status = -EIO;
@@ -439,10 +442,10 @@ alloc_dmio_job(stolearn_t *stl, struct bio *bio, int index)
 }
 
 static void
-copy_pcache_to_bio(stolearn_t *stl, struct bio *bio, int index)
+copy_pcache_to_bio(stolearn_t *stl, struct bio *bio, bno_t bno)
 {
-	sector_t	sector = index << stl->block_shift;
-	cacheinfo_t	*ci = stl->cacheinfos + index;
+	sector_t	sector = bno << stl->block_shift;
+	cacheinfo_t	*ci = stl->cacheinfos + bno;
 	unsigned long	flags;
 	int	err;
 
@@ -466,11 +469,11 @@ copy_pcache_to_bio(stolearn_t *stl, struct bio *bio, int index)
 }
 
 static void
-cache_read_miss(stolearn_t *stl, struct bio *bio, int index)
+cache_read_miss(stolearn_t *stl, struct bio *bio, bno_t bno)
 {
 	dmio_job_t	*job;
 
-	job = alloc_dmio_job(stl, bio, index);
+	job = alloc_dmio_job(stl, bio, bno);
 	if (likely(job)) {
 		job->type = READ_BACKINGDEV;
 		atomic_inc(&stl->nr_jobs);
@@ -484,21 +487,21 @@ static void
 cache_read(stolearn_t *stl, struct bio *bio)
 {
 	cacheinfo_t	*ci;
-	int	index;
+	bno_t	bno;
 	unsigned long	flags;
 
 	spin_lock_irqsave(&stl->cache_spin_lock, flags);
 
-	if (cache_lookup(stl, bio, &index, &flags)) {
-		stl->cacheinfos[index].n_readers++;
+	if (cache_lookup(stl, bio, &bno, &flags)) {
+		stl->cacheinfos[bno].n_readers++;
 		stl->cache_hits++;
 		spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 
-		copy_pcache_to_bio(stl, bio, index);
+		copy_pcache_to_bio(stl, bio, bno);
 		return;
 	}
 
-	ci = stl->cacheinfos + index;
+	ci = stl->cacheinfos + bno;
 
 	if (IS_VALID_CACHE_STATE(ci->state)) {
 		/* This means that cache read uses a victim cache */
@@ -507,11 +510,11 @@ cache_read(stolearn_t *stl, struct bio *bio)
 	}
 
 	ci->state = INPROG;
-	ci->dbn = bio->bi_iter.bi_sector;
+	ci->bno = SECTOR_TO_BNO(stl, bio->bi_iter.bi_sector);
 
 	spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 
-	cache_read_miss(stl, bio, index);
+	cache_read_miss(stl, bio, bno);
 }
 
 static void
@@ -519,14 +522,14 @@ cache_write(stolearn_t *stl, struct bio *bio)
 {
 	dmio_job_t	*job;
 	cacheinfo_t	*ci;
-	int	index;
+	bno_t	bno;
 	unsigned long	flags;
 
 	spin_lock_irqsave(&stl->cache_spin_lock, flags);
 
-	cache_lookup(stl, bio, &index, &flags);
+	cache_lookup(stl, bio, &bno, &flags);
 
-	ci = stl->cacheinfos + index;
+	ci = stl->cacheinfos + bno;
 
 	if (IS_VALID_CACHE_STATE(ci->state)) {
 		stl->cached_blocks--;
@@ -534,11 +537,11 @@ cache_write(stolearn_t *stl, struct bio *bio)
 	}
 
 	ci->state = INPROG;
-	ci->dbn = bio->bi_iter.bi_sector;
+	ci->bno = SECTOR_TO_BNO(stl, bio->bi_iter.bi_sector);
 
 	spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 
-	job = alloc_dmio_job(stl, bio, index);
+	job = alloc_dmio_job(stl, bio, bno);
 	if (likely(job)) {
 		job->type = WRITE_BACKINGDEV;
 		atomic_inc(&job->stl->nr_jobs);
@@ -644,7 +647,7 @@ init_caches(stolearn_t *stl)
 	int	i;
 
 	for (i = 0, ci = stl->cacheinfos; i < stl->size; i++, ci++) {
-		ci->dbn = 0;
+		ci->bno = 0;
 		ci->n_readers = 0;
 		ci->state = INVALID;
 	}
