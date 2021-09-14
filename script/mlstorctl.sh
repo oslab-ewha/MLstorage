@@ -40,15 +40,34 @@ function create_mlstor() {
     nns=`get_cur_nns`
     echo "stolearn-nn attach $2" > /sys/kernel/stolearn-nn/mgmt
     nn=`guess_new_nn "$nns"`
-    cachesize=`expr $2 \* 8`
+    size=`expr $2 \* 80`
+    total_mem=`grep MemTotal /proc/meminfo | awk '{print $2}'`
+    size_max=`expr $total_mem / 1024 / 2`
+    if [[ $size -gt $size_max ]]; then
+       size=$size_max
+    fi
     sectors=`get_sectors $1`
-    echo "0 $sectors stolearn-cache $1 /dev/stolearn-nn$nn $cachesize" | dmsetup create $3
+    echo "0 $sectors stolearn-cache $1 /dev/stolearn-nn$nn $size" | dmsetup create $3 >& /dev/null
+    if [[ $? -ne 0 ]]; then
+	echo "failed to create MLstorage: $1"
+	echo "stolearn-nn detach $nn" > /sys/kernel/stolearn-nn/mgmt 2> /dev/null
+	exit 2
+    fi
 }
 
 function delete_mlstor() {
+    dmsetup info $1 >& /dev/null
+    if [[ $? -ne 0 ]]; then
+	echo "MLstorage not found: $1"
+	exit 3
+    fi
     nn=`get_attached_nn $1`
-    dmsetup remove $1
-    echo "stolearn-nn detach $nn" > /sys/kernel/stolearn-nn/mgmt
+    dmsetup remove $1 >& /dev/null
+    if [[ $? -ne 0 ]]; then
+	echo "error: $1: failed to remove MLstorage: is it mounted?"
+	exit 4
+    fi
+    echo "stolearn-nn detach $nn" > /sys/kernel/stolearn-nn/mgmt 2> /dev/null
 }
 
 if [[ $EUID -ne 0 ]]; then
