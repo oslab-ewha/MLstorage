@@ -2,55 +2,21 @@
 
 function usage() {
 	    cat <<EOF
-Usage: mlstorctl -c -b <backing device> -s <nn size> <mlstor name>
+Usage: mlstorctl -c -b <backing device> -C <cache device> <mlstor name>
        mlstorctl -d <mlstor name>
 EOF
 }
-
-MGMT=/sys/kernel/stolearn-nn/mgmt
 
 function get_sectors() {
     size=`lsblk -bln -o SIZE $1 | head -n 1`
     expr $size / 512
 }
 
-function get_cur_nns() {
-    (cat $MGMT | grep -Eo '^stolearn-nn[[:digit:]]+' | grep -Eo [[:digit:]]+ | sort) 2> /dev/null
-}
-
-function guess_new_nn() {
-    for nn in `get_cur_nns`; do
-	echo $1 | grep -wq $nn
-	if [ $? -ne 0 ]; then
-	    echo $nn
-	    exit
-	fi
-    done
-}
-
-function get_attached_nn() {
-    (dmsetup table $1 | grep -Eo 'stolearn-nn[[:digit:]]+' | grep -Eo [[:digit:]]+) 2> /dev/null
-}
-
 function create_mlstor() {
-    if [[ ! -d /sys/kernel/stolearn-nn ]]; then
-	echo "stolearn-nn kernel module not installed"
-	exit 3
-    fi
-    nns=`get_cur_nns`
-    echo "stolearn-nn attach $2" > /sys/kernel/stolearn-nn/mgmt
-    nn=`guess_new_nn "$nns"`
-    size=`expr $2 \* 80`
-    total_mem=`grep MemTotal /proc/meminfo | awk '{print $2}'`
-    size_max=`expr $total_mem / 1024 / 2`
-    if [[ $size -gt $size_max ]]; then
-       size=$size_max
-    fi
     sectors=`get_sectors $1`
-    echo "0 $sectors stolearn-cache $1 /dev/stolearn-nn$nn $size" | dmsetup create $3 >& /dev/null
+    echo "0 $sectors stolearn-cache $1 $2" | dmsetup create $3 >& /dev/null
     if [[ $? -ne 0 ]]; then
-	echo "failed to create MLstorage: $1"
-	echo "stolearn-nn detach $nn" > /sys/kernel/stolearn-nn/mgmt 2> /dev/null
+	echo "failed to create MLstorage: $3"
 	exit 2
     fi
 }
@@ -61,13 +27,11 @@ function delete_mlstor() {
 	echo "MLstorage not found: $1"
 	exit 3
     fi
-    nn=`get_attached_nn $1`
     dmsetup remove $1 >& /dev/null
     if [[ $? -ne 0 ]]; then
 	echo "error: $1: failed to remove MLstorage: is it mounted?"
 	exit 4
     fi
-    echo "stolearn-nn detach $nn" > /sys/kernel/stolearn-nn/mgmt 2> /dev/null
 }
 
 if [[ $EUID -ne 0 ]]; then
@@ -78,8 +42,9 @@ fi
 create=
 delete=
 backdev=
+cachedev=
 size=
-while getopts "cdb:s:h" arg
+while getopts "cdb:C:h" arg
 do
     case $arg in
 	c)
@@ -88,8 +53,8 @@ do
 	d)
 	    delete=true
 	    ;;
-	s)
-	    size=$OPTARG
+	C)
+	    cachedev=$OPTARG
 	    ;;
 	b)
 	    backdev=$OPTARG
@@ -119,11 +84,11 @@ if [[ -n $create ]]; then
 	echo "backing device is required"
 	exit 3
     fi
-    if [[ -z $size ]]; then
-	echo "size is required"
+    if [[ -z $cachedev ]]; then
+	echo "caching device is required"
 	exit 3
     fi
-    create_mlstor $backdev $size $name
+    create_mlstor $backdev $cachedev $name
 elif [[ -n $delete ]]; then
     delete_mlstor $name
 else
