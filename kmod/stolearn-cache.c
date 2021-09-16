@@ -60,14 +60,8 @@
 #define VERSION_STR	"1.0.0"
 #define DM_MSG_PREFIX	"stolearn-cache"
 
-#define READCACHE	1
-#define WRITECACHE	2
 #define READSOURCE	3
 #define WRITESOURCE	4
-#define READCACHE_DONE	5
-
-#define WRITETHROUGH	0
-#define WRITEAROUND	1
 
 #define GENERIC_ERROR		-1
 #define BYTES_PER_BLOCK		512
@@ -82,7 +76,6 @@
 #define INPROG		2	/* IO (cache fill) is in progress */
 #define CACHEREADINPROG	3
 #define INPROG_INVALID	4	/* Write invalidated during a refill */
-#define DIRTY		5
 
 #define DEV_PATHLEN	128
 
@@ -146,13 +139,11 @@ struct kcached_job {
 	struct bio *bio;	/* Original bio */
 	struct dm_io_region disk;
 	struct dm_io_region cache;
-	struct work_struct	work;
 	int index;
 	int rw;
 	int error;
 };
 
-static struct workqueue_struct *kcached_wq;
 static struct kmem_cache *job_cache;
 static mempool_t *job_pool;
 
@@ -193,7 +184,8 @@ static int jobs_init(void)
 	return 0;
 }
 
-static void jobs_exit(void)
+static void
+jobs_exit(void)
 {
 	mempool_destroy(job_pool);
 	kmem_cache_destroy(job_cache);
@@ -202,132 +194,71 @@ static void jobs_exit(void)
 }
 
 static void
-rc_io_callback(unsigned long error, void *context)
+job_free(struct kcached_job *job)
 {
-	struct kcached_job *job = (struct kcached_job *)context;
 	struct cache_context *dmc = job->dmc;
-	struct bio *bio;
-	unsigned long flags;
-	int invalid = 0;
 
-	ASSERT(job);
-	bio = job->bio;
-	ASSERT(bio);
-	if (error)
-		DMERR("%s: io error %ld", __func__, error);
-	if (job->rw == READSOURCE || job->rw == WRITESOURCE) {
-		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-		if (dmc->cache_state[job->index] != INPROG) {
-			ASSERT(dmc->cache_state[job->index] == INPROG_INVALID);
-			invalid++;
-		}
-		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-		if (error || invalid) {
-			if (invalid)
-				DMERR("%s: cache fill invalidation, sector %lu, size %u",
-				      __func__,
-				      (unsigned long)bio->bi_iter.bi_sector,
-				      bio->bi_iter.bi_size);
-			bio->bi_status= error;
-			bio_io_error(bio);
-			spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-			dmc->cache_state[job->index] = INVALID;
-			spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-			goto out;
-		} else {
-			job->rw = WRITECACHE;
-			queue_work(kcached_wq, &job->work);
-			return;
-		}
-	} else if (job->rw == READCACHE) {
-		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-		ASSERT(dmc->cache_state[job->index] == INPROG_INVALID ||
-		       dmc->cache_state[job->index] ==  CACHEREADINPROG);
-		if (dmc->cache_state[job->index] == INPROG_INVALID)
-			invalid++;
-		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-		if (!invalid && !error) {
-			bio_endio(bio);
-			spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-			dmc->cache_state[job->index] = VALID;
-			spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-			goto out;
-		}
-		/* error || invalid || bounce back to source device */
-		job->rw = READCACHE_DONE;
-		queue_work(kcached_wq, &job->work);
-		return;
-	} else {
-		ASSERT(job->rw == WRITECACHE);
-		bio_endio(bio);
-		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-		ASSERT((dmc->cache_state[job->index] == INPROG) ||
-		       (dmc->cache_state[job->index] == INPROG_INVALID));
-		if (error || dmc->cache_state[job->index] == INPROG_INVALID) {
-			dmc->cache_state[job->index] = INVALID;
-		} else {
-			dmc->cache_state[job->index] = VALID;
-			dmc->cached_blocks++;
-		}
-		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-	}
-out:
 	mempool_free(job, job_pool);
 	if (atomic_dec_and_test(&dmc->nr_jobs))
 		wake_up(&dmc->destroyq);
-}
-
-static int
-do_io(struct kcached_job *job)
-{
-	struct cache_context *dmc = job->dmc;
-	struct bio *bio = job->bio;
-	int	err;
-
-	ASSERT(job->rw == WRITECACHE);
-	dmc->cache_writes++;
-
-	err = pcache_submit(dmc->pcache, true, job->cache.sector, bio);
-	rc_io_callback(err, job);
-
-	return 0;
-}
-
-static int
-rc_do_complete(struct kcached_job *job)
-{
-	struct bio *bio = job->bio;
-	struct cache_context *dmc = job->dmc;
-	unsigned long flags;
-
-	ASSERT(job->rw == READCACHE_DONE);
-	/* error || block invalidated while reading from cache */
-	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-	dmc->cache_state[job->index] = INVALID;
-	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-	mempool_free(job, job_pool);
-	if (atomic_dec_and_test(&dmc->nr_jobs))
-		wake_up(&dmc->destroyq);
-	/* Kick this IO back to the source bdev */
-	rc_start_uncached_io(dmc, bio);
-	return 0;
 }
 
 static void
-do_work(struct work_struct *work)
+copy_bio_to_pcache(struct kcached_job *job)
 {
-	struct kcached_job	*job = container_of(work, struct kcached_job, work);
+	struct cache_context *dmc = job->dmc;
+	struct bio *bio = job->bio;
+	unsigned long flags;
+	int	err;
 
-	switch (job->rw) {
-	case WRITECACHE:
-		do_io(job);
-		break;
-	case READCACHE_DONE:
-		rc_do_complete(job);
-		break;
-	default:
-		ASSERT(0);
-		break;
+	dmc->cache_writes++;
+
+	err = pcache_submit(dmc->pcache, true, job->cache.sector, bio);
+
+	bio_endio(bio);
+	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+	ASSERT((dmc->cache_state[job->index] == INPROG) || (dmc->cache_state[job->index] == INPROG_INVALID));
+	if (err || dmc->cache_state[job->index] == INPROG_INVALID) {
+		dmc->cache_state[job->index] = INVALID;
+	} else {
+		dmc->cache_state[job->index] = VALID;
+		dmc->cached_blocks++;
+	}
+	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	job_free(job);
+}
+
+static void
+rc_io_callback(unsigned long err, void *context)
+{
+	struct kcached_job	*job = (struct kcached_job *)context;
+	struct cache_context	*dmc = job->dmc;
+	struct bio	*bio;
+	unsigned long	flags;
+	bool	invalid = false;
+
+	bio = job->bio;
+	if (err)
+		DMERR("%s: io error %ld", __func__, err);
+
+	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+	if (dmc->cache_state[job->index] != INPROG) {
+		ASSERT(dmc->cache_state[job->index] == INPROG_INVALID);
+		invalid = true;
+	}
+	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	if (err || invalid) {
+		if (invalid)
+			DMERR("%s: cache fill invalidation, sector %lu, size %u",
+			      __func__, (unsigned long)bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
+		bio->bi_status= err;
+		bio_io_error(bio);
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->cache_state[job->index] = INVALID;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+		job_free(job);
+	} else {
+		copy_bio_to_pcache(job);
 	}
 }
 
@@ -451,10 +382,10 @@ cache_lookup(struct cache_context *dmc, struct bio *bio, int *index)
 	return INVALID;
 }
 
-static struct kcached_job *new_kcached_job(struct cache_context *dmc,
-					   struct bio *bio, int index)
+static struct kcached_job *
+new_kcached_job(struct cache_context *dmc, struct bio *bio, int index)
 {
-	struct kcached_job *job;
+	struct kcached_job	*job;
 
 	job = mempool_alloc(job_pool, GFP_NOIO);
 	if (!job)
@@ -474,30 +405,28 @@ static struct kcached_job *new_kcached_job(struct cache_context *dmc,
 	job->bio = bio;
 	job->index = index;
 	job->error = 0;
-	INIT_WORK(&job->work, do_work);
 	return job;
 }
 
-static void cache_read_miss(struct cache_context *dmc,
-			    struct bio *bio, int index)
+static struct kcached_job *
+alloc_kcached_job(struct cache_context *dmc, struct bio *bio, int index)
 {
 	struct kcached_job *job;
-	unsigned long flags;
 
 	job = new_kcached_job(dmc, bio, index);
 	if (unlikely(!job)) {
-		DMERR("%s: Cannot allocate job\n", __func__);
+		unsigned long	flags;
+
+		DMERR("failed to allocate job\n");
+
 		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
 		dmc->cache_state[index] = INVALID;
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+
 		bio->bi_status = -EIO;
 		bio_io_error(bio);
-	} else {
-		job->rw = READSOURCE;
-		atomic_inc(&dmc->nr_jobs);
-		dmc->disk_reads++;
-		dm_io_async_bvec(&job->disk, READ, bio, rc_io_callback, job);
 	}
+	return job;
 }
 
 static int
@@ -557,54 +486,86 @@ cache_invalidate_blocks(struct cache_context *dmc, struct bio *bio)
 }
 
 static void
-cache_read(struct cache_context *dmc, struct bio *bio)
+copy_pcache_to_bio(struct cache_context *dmc, struct bio *bio, int index)
 {
-	int index;
-	int res;
-	unsigned long flags;
+	sector_t	sector = index << dmc->block_shift;
+	bool	invalid = false;
+	unsigned long	flags;
+	int	err;
+
+	atomic_inc(&dmc->nr_jobs);
+	dmc->cache_reads++;
+	err = pcache_submit(dmc->pcache, false, sector, bio);
 
 	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-	res = cache_lookup(dmc, bio, &index);
-	if ((res == VALID) &&
-	    (dmc->cache[index].dbn == bio->bi_iter.bi_sector)) {
-		struct kcached_job *job;
 
+	ASSERT(dmc->cache_state[index] == INPROG_INVALID || dmc->cache_state[index] == CACHEREADINPROG);
+	if (dmc->cache_state[index] == INPROG_INVALID)
+		invalid = true;
+	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+
+	if (!invalid && err == 0) {
+		bio_endio(bio);
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->cache_state[index] = VALID;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+	else {
+		/* error || block invalidated while reading from cache */
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->cache_state[index] = INVALID;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+
+		rc_start_uncached_io(dmc, bio);
+	}
+}
+
+static void
+cache_read_miss(struct cache_context *dmc, struct bio *bio, int index)
+{
+	struct kcached_job *job;
+
+	job = alloc_kcached_job(dmc, bio, index);
+	if (likely(job)) {
+		job->rw = READSOURCE;
+		atomic_inc(&dmc->nr_jobs);
+		dmc->disk_reads++;
+
+		dm_io_async_bvec(&job->disk, READ, bio, rc_io_callback, job);
+	}
+}
+
+static void
+cache_read(struct cache_context *dmc, struct bio *bio)
+{
+	int	index;
+	int	res;
+	unsigned long	flags;
+
+	spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+
+	res = cache_lookup(dmc, bio, &index);
+	if ((res == VALID) && (dmc->cache[index].dbn == bio->bi_iter.bi_sector)) {
 		dmc->cache_state[index] = CACHEREADINPROG;
 		dmc->cache_hits++;
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-		job = new_kcached_job(dmc, bio, index);
-		if (unlikely(!job)) {
-			DMERR("cache_read(_hit): Cannot allocate job\n");
-			spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-			dmc->cache_state[index] = VALID;
-			spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-			bio->bi_status = -EIO;
-			bio_io_error(bio);
-		} else {
-			int	err;
 
-			job->rw = READCACHE;
-			atomic_inc(&dmc->nr_jobs);
-			dmc->cache_reads++;
-			err = pcache_submit(dmc->pcache, false, job->cache.sector, bio);
-			rc_io_callback(err, job);
-		}
+		copy_pcache_to_bio(dmc, bio, index);
 		return;
 	}
-	if (cache_invalidate_blocks(dmc, bio) > 0) {
+
+	if (cache_invalidate_blocks(dmc, bio) > 0 || res == GENERIC_ERROR || res >= INPROG) {
 		/* A non zero return indicates an inprog invalidation */
-		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-		rc_start_uncached_io(dmc, bio);
-		return;
-	}
-	if (res == -1 || res >= INPROG) {
-		/* We either didn't find a cache slot in the set we were
+
+		/* Or we either didn't find a cache slot in the set we were
 		 * looking at or the block we are trying to read is being
 		 * refilled into cache. */
+
 		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
 		rc_start_uncached_io(dmc, bio);
 		return;
 	}
+
 	/* (res == INVALID) Cache Miss And we found cache blocks to replace
 	 * Claim the cache blocks before giving up the spinlock */
 	if (dmc->cache_state[index] == VALID) {
@@ -613,7 +574,9 @@ cache_read(struct cache_context *dmc, struct bio *bio)
 	}
 	dmc->cache_state[index] = INPROG;
 	dmc->cache[index].dbn = bio->bi_iter.bi_sector;
+
 	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+
 	cache_read_miss(dmc, bio, index);
 }
 
@@ -646,20 +609,15 @@ cache_write(struct cache_context *dmc, struct bio *bio)
 	dmc->cache_state[index] = INPROG;
 	dmc->cache[index].dbn = bio->bi_iter.bi_sector;
 	spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-	job = new_kcached_job(dmc, bio, index);
-	if (unlikely(!job)) {
-		DMERR("%s: Cannot allocate job\n", __func__);
-		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
-		dmc->cache_state[index] = INVALID;
-		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
-		bio->bi_status= -EIO;
-		bio_io_error(bio);
-		return;
+
+	job = alloc_kcached_job(dmc, bio, index);
+	if (likely(job)) {
+		job->rw = WRITESOURCE;
+		atomic_inc(&job->dmc->nr_jobs);
+		dmc->disk_writes++;
+
+		dm_io_async_bvec(&job->disk, WRITE, bio, rc_io_callback, job);
 	}
-	job->rw = WRITESOURCE;
-	atomic_inc(&job->dmc->nr_jobs);
-	dmc->disk_writes++;
-	dm_io_async_bvec(&job->disk, WRITE, bio, rc_io_callback, job);
 }
 
 #define bio_barrier(bio)		((bio)->bi_opf & REQ_PREFLUSH)
@@ -713,9 +671,7 @@ rc_uncached_io_callback(unsigned long error, void *context)
 	} else {
 		bio_endio(job->bio);
 	}
-	mempool_free(job, job_pool);
-	if (atomic_dec_and_test(&dmc->nr_jobs))
-		wake_up(&dmc->destroyq);
+	job_free(job);
 }
 
 static void
@@ -1036,10 +992,6 @@ int __init rc_init(void)
 	if (ret)
 		return ret;
 
-	kcached_wq = create_singlethread_workqueue("kcached");
-	if (!kcached_wq)
-		return -ENOMEM;
-
 	ret = dm_register_target(&cache_target);
 	if (ret < 0)
 		return ret;
@@ -1050,7 +1002,6 @@ void rc_exit(void)
 {
 	dm_unregister_target(&cache_target);
 	jobs_exit();
-	destroy_workqueue(kcached_wq);
 }
 
 module_init(rc_init);
