@@ -349,11 +349,12 @@ static bool
 has_nonprog_blk(stolearn_t *stl, bno_t bno_start)
 {
 	bno_t	bno_end = bno_start + stl->assoc;
+	cacheinfo_t	*ci;
 	bno_t	i;
 
 	/* Find INVALID slot that we can reuse */
-	for (i = bno_start; i < bno_end; i++) {
-		if (stl->cacheinfos[i].state != INPROG) {
+	for (i = bno_start, ci = stl->cacheinfos + i; i < bno_end; i++, ci++) {
+		if (ci->state != INPROG && ci->n_readers == 0) {
 			return true;
 		}
 	}
@@ -397,7 +398,7 @@ find_reclaim_blk(stolearn_t *stl, bno_t bno_start, bno_t *pbno_reclaimed, unsign
 
 		ASSERT(bno_lru >= bno_start && bno_lru < bno_end);
 
-		if (ci->state == VALID) {
+		if (ci->state == VALID && ci->n_readers == 0) {
 			if (ci->dirty) {
 				ci->state = INPROG;
 				spin_unlock_irqrestore(&stl->cache_spin_lock, *pflags);
@@ -517,6 +518,8 @@ copy_pcache_to_bio(stolearn_t *stl, struct bio *bio, bno_t bno)
 	ASSERT(ci->n_readers > 0);
 	ci->n_readers--;
 
+	if (ci->n_readers == 0)
+		wake_up_all(&stl->inprogq);
 	spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 
 	if (err == 0)
@@ -623,6 +626,33 @@ stolearn_map(struct dm_target *ti, struct bio *bio)
 	else
 		cache_write(stl, bio);
 	return DM_MAPIO_SUBMITTED;
+}
+
+static void
+writeback_all_dirty(stolearn_t *stl)
+{
+	cacheinfo_t	*ci;
+	unsigned long	flags;
+	bno_t	i;
+
+	spin_lock_irqsave(&stl->cache_spin_lock, flags);
+
+	for (i = 0, ci = stl->cacheinfos; i < stl->size; i++, ci++) {
+		if (ci->state == VALID && ci->dirty) {
+			while (ci->n_readers > 0) {
+				spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
+				wait_event(stl->inprogq, ci->n_readers == 0);
+				spin_lock_irqsave(&stl->cache_spin_lock, flags);
+			}
+			ci->state = INPROG;
+			spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
+
+			writeback(stl, ci, i);
+			spin_lock_irqsave(&stl->cache_spin_lock, flags);
+		}
+	}
+
+	spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
 }
 
 static inline int
@@ -844,6 +874,7 @@ stolearn_dtr(struct dm_target *ti)
 {
 	stolearn_t	*stl = (stolearn_t *) ti->private;
 
+	writeback_all_dirty(stl);
 	wait_event(stl->destroyq, !atomic_read(&stl->nr_jobs));
 
 	if (stl->reads + stl->writes > 0) {
