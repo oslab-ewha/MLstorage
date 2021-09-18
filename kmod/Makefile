@@ -26,7 +26,6 @@ endif
 MKDIR := mkdir -pv
 CP := cp -v
 
-obj-m += stolearn-nn.o
 obj-m += mlstor.o
 
 mlstor-y := stolearn-cache.o pcache.o
