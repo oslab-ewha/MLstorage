@@ -143,6 +143,7 @@ typedef struct _dmio_job {
 	bno_t	bno;
 	int	type;
 	int	error;
+	struct work_struct	work;
 } dmio_job_t;
 
 #define WAIT_INPROG_EVENT(stl, flags, cond)	do {				\
@@ -153,6 +154,9 @@ typedef struct _dmio_job {
 
 static struct kmem_cache	*job_cache;
 static mempool_t		*job_pool;
+
+/* 5.x kernel seem to halt if a map thread exeucutes directly writeback */
+static struct workqueue_struct	*wq_writeback;
 
 static dmio_job_t *alloc_dmio_job(stolearn_t *stl, struct bio *bio, bno_t bno_dm, bno_t bno);
 static void dmio_done(unsigned long err, void *context);
@@ -373,6 +377,14 @@ has_nonprog_blk(stolearn_t *stl, bno_t bno_start)
 	((bno) + 1 == (bno_end)) ? (bno_start): ((bno) + 1)
 
 static void
+do_writeback_async(struct work_struct *work)
+{
+	dmio_job_t	*job = container_of(work, dmio_job_t, work);
+
+	req_dm_io(job, REQ_OP_WRITE);
+}
+
+static void
 writeback(stolearn_t *stl, cacheinfo_t *ci, bno_t bno)
 {
 	dmio_job_t	*job;
@@ -383,7 +395,8 @@ writeback(stolearn_t *stl, cacheinfo_t *ci, bno_t bno)
 		atomic_inc(&job->stl->nr_jobs);
 		stl->disk_writes++;
 
-		req_dm_io(job, REQ_OP_WRITE);
+		INIT_WORK(&job->work, do_writeback_async);
+		queue_work(wq_writeback, &job->work);
 	}
 }
 
@@ -964,9 +977,18 @@ rc_init(void)
 	if (ret)
 		return ret;
 
+	wq_writeback = create_singlethread_workqueue("writeback");
+	if (wq_writeback == NULL) {
+		jobs_exit();
+		return -ENOMEM;
+	}
+
 	ret = dm_register_target(&stolearn_target);
-	if (ret < 0)
+	if (ret < 0) {
+		jobs_exit();
+		destroy_workqueue(wq_writeback);
 		return ret;
+	}
 	return 0;
 }
 
@@ -974,6 +996,7 @@ void
 rc_exit(void)
 {
 	dm_unregister_target(&stolearn_target);
+	destroy_workqueue(wq_writeback);
 	jobs_exit();
 }
 
