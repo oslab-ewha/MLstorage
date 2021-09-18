@@ -68,14 +68,6 @@
 #define CACHE_BLOCK_SIZE	(PAGE_SIZE / BYTES_PER_BLOCK)
 #define CONSECUTIVE_BLOCKS	512
 
-/* States of a cache block */
-#define INVALID		0
-#define VALID		1
-#define INPROG		2	/* IO (cache fill) is in progress */
-
-#define IS_VALID_CACHE_STATE(s)	((s) == VALID)
-#define IS_VALID_OR_PROG_CACHE_STATE(s)	(IS_VALID_CACHE_STATE(s) || (s) == INPROG)
-
 #define DEV_PATHLEN	128
 
 #ifndef DM_MAPIO_SUBMITTED
@@ -87,6 +79,13 @@
 
 typedef unsigned long	bno_t;
 
+/* States of a cache block */
+typedef enum {
+	INVALID = 0,
+	VALID,
+	INPROG	/* IO (cache fill) is in progress */
+} cache_state_t;
+
 #define SECTOR_TO_BNO(stl, sector)	((sector) >> (stl)->block_shift)
 #define BNO_TO_SECTOR(stl, bno)		((bno) << (stl)->block_shift)
 
@@ -95,7 +94,7 @@ typedef unsigned long	bno_t;
 typedef struct _cacheinfo {
 	bno_t	bno;		/* block number, index of the cached block */
 	u16	n_readers;
-	int	state:15;
+	cache_state_t	state:15;
 	bool	dirty:1;
 } cacheinfo_t;
 #pragma pack(pop)
@@ -398,7 +397,7 @@ find_reclaim_blk(stolearn_t *stl, bno_t bno_start, bno_t *pbno_reclaimed, unsign
 
 		ASSERT(bno_lru >= bno_start && bno_lru < bno_end);
 
-		if (IS_VALID_CACHE_STATE(ci->state)) {
+		if (ci->state == VALID) {
 			if (ci->dirty) {
 				ci->state = INPROG;
 				spin_unlock_irqrestore(&stl->cache_spin_lock, *pflags);
@@ -563,7 +562,7 @@ cache_read(stolearn_t *stl, struct bio *bio)
 
 	ci = stl->cacheinfos + bno;
 
-	if (IS_VALID_CACHE_STATE(ci->state)) {
+	if (ci->state == VALID) {
 		/* This means that cache read uses a victim cache */
 		stl->cached_blocks--;
 		stl->replace++;
@@ -590,7 +589,7 @@ cache_write(stolearn_t *stl, struct bio *bio)
 
 	ci = stl->cacheinfos + bno;
 
-	if (IS_VALID_CACHE_STATE(ci->state)) {
+	if (ci->state == VALID) {
 		stl->cached_blocks--;
 		stl->cache_wr_replace++;
 	}
