@@ -252,6 +252,12 @@ pcache_submit(pcache_t *pcache, bool is_write, sector_t sector, struct bio *bio)
 	return 0;
 }
 
+struct page *
+pcache_get_page(pcache_t *pcache, sector_t sector)
+{
+	return pcache_lookup_page(pcache, sector);
+}
+
 pcache_t *
 pcache_create(void)
 {
