@@ -145,6 +145,12 @@ typedef struct _dmio_job {
 	int	error;
 } dmio_job_t;
 
+#define WAIT_INPROG_EVENT(stl, flags, cond)	do {				\
+		spin_unlock_irqrestore(&(stl)->cache_spin_lock, flags);		\
+		wait_event((stl)->inprogq, cond);				\
+		spin_lock_irqsave(&(stl)->cache_spin_lock, flags);		\
+	} while (0)
+
 static struct kmem_cache	*job_cache;
 static mempool_t		*job_pool;
 
@@ -303,7 +309,7 @@ hash_block(stolearn_t *stl, bno_t bno)
 }
 
 static bool
-find_valid_blk(stolearn_t *stl, bno_t bno, bno_t bno_start, bno_t *pbno, unsigned long *pflags)
+find_valid_blk(stolearn_t *stl, bool no_reader, bno_t bno, bno_t bno_start, bno_t *pbno, unsigned long *pflags)
 {
 	cacheinfo_t	*ci;
 	bno_t	bno_end = bno_start + stl->assoc;
@@ -314,12 +320,14 @@ again:
 		if (bno == ci->bno) {
 			switch (ci->state) {
 			case VALID:
+				if (no_reader && ci->n_readers > 0) {
+					WAIT_INPROG_EVENT(stl, *pflags, ci->n_readers == 0);
+					goto again;
+				}
 				*pbno = i;
 				return true;
 			case INPROG:
-				spin_unlock_irqrestore(&stl->cache_spin_lock, *pflags);
-				wait_event(stl->inprogq, ci->state != INPROG);
-				spin_lock_irqsave(&stl->cache_spin_lock, *pflags);
+				WAIT_INPROG_EVENT(stl, *pflags, ci->state != INPROG);
 				goto again;
 			default:
 				break;
@@ -418,7 +426,7 @@ find_reclaim_blk(stolearn_t *stl, bno_t bno_start, bno_t *pbno_reclaimed, unsign
 }
 
 static bool
-cache_lookup(stolearn_t *stl, struct bio *bio, bno_t *pbno, unsigned long *pflags)
+cache_lookup(stolearn_t *stl, struct bio *bio, bno_t *pbno, bool no_reader, unsigned long *pflags)
 {
 	bno_t	bno = SECTOR_TO_BNO(stl, bio->bi_iter.bi_sector);
 	unsigned long	set_number = hash_block(stl, bno);
@@ -428,7 +436,7 @@ cache_lookup(stolearn_t *stl, struct bio *bio, bno_t *pbno, unsigned long *pflag
 	bno_start = stl->assoc * set_number;
 
 again:
-	if (find_valid_blk(stl, bno, bno_start, pbno, pflags))
+	if (find_valid_blk(stl, no_reader, bno, bno_start, pbno, pflags))
 		return true;
 
 	if (find_invalid_blk(stl, bno_start, &bno_invalid))
@@ -438,9 +446,7 @@ again:
 
 		/* We didn't find an invalid entry, search for oldest valid entry */
 		if (!find_reclaim_blk(stl, bno_start, &bno_reclaimed, pflags)) {
-			spin_unlock_irqrestore(&stl->cache_spin_lock, *pflags);
-			wait_event(stl->inprogq, has_nonprog_blk(stl, bno_start));
-			spin_lock_irqsave(&stl->cache_spin_lock, *pflags);
+			WAIT_INPROG_EVENT(stl, *pflags, has_nonprog_blk(stl, bno_start));
 			goto again;
 		}
 		*pbno = bno_reclaimed;
@@ -554,7 +560,7 @@ cache_read(stolearn_t *stl, struct bio *bio)
 
 	spin_lock_irqsave(&stl->cache_spin_lock, flags);
 
-	if (cache_lookup(stl, bio, &bno, &flags)) {
+	if (cache_lookup(stl, bio, &bno, false, &flags)) {
 		stl->cacheinfos[bno].n_readers++;
 		stl->cache_hits++;
 		spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
@@ -588,7 +594,7 @@ cache_write(stolearn_t *stl, struct bio *bio)
 
 	spin_lock_irqsave(&stl->cache_spin_lock, flags);
 
-	cache_lookup(stl, bio, &bno, &flags);
+	cache_lookup(stl, bio, &bno, true, &flags);
 
 	ci = stl->cacheinfos + bno;
 
@@ -640,9 +646,7 @@ writeback_all_dirty(stolearn_t *stl)
 	for (i = 0, ci = stl->cacheinfos; i < stl->size; i++, ci++) {
 		if (ci->state == VALID && ci->dirty) {
 			while (ci->n_readers > 0) {
-				spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
-				wait_event(stl->inprogq, ci->n_readers == 0);
-				spin_lock_irqsave(&stl->cache_spin_lock, flags);
+				WAIT_INPROG_EVENT(stl, flags, ci->n_readers == 0);
 			}
 			ci->state = INPROG;
 			spin_unlock_irqrestore(&stl->cache_spin_lock, flags);
