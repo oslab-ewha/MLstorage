@@ -8,3 +8,7 @@ modules.order
 Module.symvers
 *.o.ur-safe
 .tmp_versions/
+/kmod/built-in.a
+/kmod/.*.o.d
+/kmod/*.mod
+/kmod/*.dwo
