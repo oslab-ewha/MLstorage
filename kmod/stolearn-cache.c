@@ -102,13 +102,13 @@ typedef struct _cacheinfo {
 /* stolearn */
 typedef struct _stolearn {
 	struct dm_target	*tgt;
-	struct dm_dev		*disk_dev;	/* Source device */
-	struct dm_dev		*cache_dev;	/* Cache device */
+	struct dm_dev		*dev_backing, *dev_caching;
 	pcache_t		*pcache;
 
 	spinlock_t	cache_spin_lock;
 	cacheinfo_t	*cacheinfos;
-	bno_t	*set_lru_next;
+	/* next bno per set for validity test */
+	bno_t	*bnos_next;
 
 	struct dm_io_client	*io_client;
 	unsigned long	size, size_nominal;
@@ -131,8 +131,8 @@ typedef struct _stolearn {
 	unsigned long	cache_reads, cache_writes;
 	unsigned long	disk_reads, disk_writes;
 
-	char	cache_devname[DEV_PATHLEN];
-	char	disk_devname[DEV_PATHLEN];
+	char	devname_backing[DEV_PATHLEN];
+	char	devname_caching[DEV_PATHLEN];
 } stolearn_t;
 
 /* DM I/O job */
@@ -413,7 +413,7 @@ find_reclaim_blk(stolearn_t *stl, bno_t bno_start, bno_t *pbno_reclaimed, unsign
 	 * a VALID entry to recycle we advance this pointer. So  we sweep
 	 * through the set looking for next blocks to recycle. This
 	 * approximates to FIFO (modulo for blocks written through). */
-	bno_lru = stl->set_lru_next[set];
+	bno_lru = stl->bnos_next[set];
 	while (slots_searched < stl->assoc) {
 		cacheinfo_t	*ci = stl->cacheinfos + bno_lru;
 
@@ -428,7 +428,7 @@ find_reclaim_blk(stolearn_t *stl, bno_t bno_start, bno_t *pbno_reclaimed, unsign
 			}
 			else {
 				*pbno_reclaimed = bno_lru;
-				stl->set_lru_next[set] = NEXT_BNO(bno_lru, bno_start, bno_end);
+				stl->bnos_next[set] = NEXT_BNO(bno_lru, bno_start, bno_end);
 				return true;
 			}
 		}
@@ -477,7 +477,7 @@ new_dmio_job(stolearn_t *stl, struct bio *bio, bno_t bno_dm, bno_t bno)
 	if (job == NULL)
 		return NULL;
 
-	job->dm_iorgn.bdev = stl->disk_dev->bdev;
+	job->dm_iorgn.bdev = stl->dev_backing->bdev;
 	if (bio) {
 		job->dm_iorgn.sector = bio->bi_iter.bi_sector;
 		job->dm_iorgn.count = to_sector(bio->bi_iter.bi_size);
@@ -716,7 +716,7 @@ init_stolearn(stolearn_t *stl)
 	stl->block_size = CACHE_BLOCK_SIZE;
 	stl->block_shift = ffs(stl->block_size) - 1;
 
-	stl->size_nominal = to_sector(stl->cache_dev->bdev->bd_inode->i_size);
+	stl->size_nominal = to_sector(stl->dev_caching->bdev->bd_inode->i_size);
 	stl->size = stl->size_nominal;
 	max_sectors_bymem = get_max_sectors_by_mem();
 	if (stl->size > max_sectors_bymem)
@@ -753,7 +753,7 @@ init_caches(stolearn_t *stl)
 
 	/* Initialize the point where LRU sweeps begin for each set */
 	for (i = 0; i < (stl->size >> stl->consecutive_shift); i++)
-		stl->set_lru_next[i] = i * stl->assoc;
+		stl->bnos_next[i] = i * stl->assoc;
 }
 
 static void
@@ -765,13 +765,13 @@ free_stolearn(stolearn_t *stl)
 		dm_io_client_destroy(stl->io_client);
 	if (stl->cacheinfos)
 		vfree(stl->cacheinfos);
-	if (stl->set_lru_next)
-		vfree(stl->set_lru_next);
+	if (stl->bnos_next)
+		vfree(stl->bnos_next);
 
-	if (stl->disk_dev)
-		dm_put_device(stl->tgt, stl->disk_dev);
-	if (stl->cache_dev)
-		dm_put_device(stl->tgt, stl->cache_dev);
+	if (stl->dev_backing)
+		dm_put_device(stl->tgt, stl->dev_backing);
+	if (stl->dev_caching)
+		dm_put_device(stl->tgt, stl->dev_caching);
 	kfree(stl);
 }
 
@@ -798,12 +798,12 @@ stolearn_ctr(struct dm_target *tgt, unsigned int argc, char **argv)
 	}
 	stl->tgt = tgt;
 
-	if (rc_get_dev(tgt, argv[0], &stl->disk_dev, stl->disk_devname, tgt->len)) {
+	if (rc_get_dev(tgt, argv[0], &stl->dev_backing, stl->devname_backing, tgt->len)) {
 		tgt->error = "stolearn-cache: failed to lookup backing device";
 		kfree(stl);
 		return -EINVAL;
 	}
-	if (rc_get_dev(tgt, argv[1], &stl->cache_dev, stl->cache_devname, 0)) {
+	if (rc_get_dev(tgt, argv[1], &stl->dev_caching, stl->devname_caching, 0)) {
 		tgt->error = "stolearn-cache: failed to lookup caching device";
 		free_stolearn(stl);
 		return -EINVAL;
@@ -865,9 +865,9 @@ stolearn_ctr(struct dm_target *tgt, unsigned int argc, char **argv)
 		return -ENOMEM;
 	}
 
-	stl->set_lru_next = vmalloc((stl->size >> stl->consecutive_shift) * sizeof(u32));
-	if (stl->set_lru_next == NULL) {
-		tgt->error = "failed to allocate set_lru_next\n";
+	stl->bnos_next = vmalloc((stl->size >> stl->consecutive_shift) * sizeof(u32));
+	if (stl->bnos_next == NULL) {
+		tgt->error = "failed to allocate bnos_next\n";
 		free_stolearn(stl);
 		return -ENOMEM;
 	}
@@ -910,10 +910,10 @@ stolearn_dtr(struct dm_target *ti)
 
 	dm_io_client_destroy(stl->io_client);
 	vfree(stl->cacheinfos);
-	vfree(stl->set_lru_next);
+	vfree(stl->bnos_next);
 
-	dm_put_device(ti, stl->disk_dev);
-	dm_put_device(ti, stl->cache_dev);
+	dm_put_device(ti, stl->dev_backing);
+	dm_put_device(ti, stl->dev_caching);
 	kfree(stl);
 }
 
@@ -937,7 +937,7 @@ stolearn_status_table(stolearn_t *stl, status_type_t type, char *result, unsigne
 	DMEMIT("conf:\n\tStolearn-NN dev (%s), disk dev (%s)"
 	       "\tcapacity(%luM), associativity(%u), block size(%uK)\n"
 	       "\ttotal blocks(%lu)\n",
-	       stl->cache_devname, stl->disk_devname,
+	       stl->devname_caching, stl->devname_backing,
 	       (unsigned long)stl->size_nominal * stl->block_size >> 11, stl->assoc,
 	       stl->block_size >> (10 - SECTOR_SHIFT),
 	       (unsigned long)stl->size_nominal);
