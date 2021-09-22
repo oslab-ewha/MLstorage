@@ -59,9 +59,6 @@
 #define VERSION_STR	"1.0.0"
 #define DM_MSG_PREFIX	"stolearn-cache"
 
-#define READ_BACKINGDEV		1
-#define WRITE_BACKINGDEV	2
-
 #define BYTES_PER_BLOCK		512
 /* Default cache parameters */
 #define DEFAULT_CACHE_ASSOC	512
@@ -78,6 +75,11 @@
 /* Number of pages for I/O */
 
 typedef unsigned long	bno_t;
+
+typedef enum {
+	READ_BACKINGDEV = 1,
+	WRITE_BACKINGDEV
+} job_type_t;
 
 /* States of a cache block */
 typedef enum {
@@ -146,11 +148,11 @@ typedef struct _stolearn {
 
 /* DM I/O job */
 typedef struct _dmio_job {
-	cacheset_t	*ccs;
+	job_type_t	type;
+	stolearn_t	*stl;
 	struct bio	*bio;	/* Original bio */
 	struct dm_io_region	dm_iorgn;
 	bno_t	bno;
-	int	type;
 	int	error;
 	struct work_struct	work;
 } dmio_job_t;
@@ -167,14 +169,13 @@ static mempool_t		*job_pool;
 /* 5.x kernel seem to halt if a map thread exeucutes directly writeback */
 static struct workqueue_struct	*wq_writeback;
 
-static dmio_job_t *alloc_dmio_job(cacheset_t *ccs, struct bio *bio, bno_t bno_dm, bno_t bno);
+static dmio_job_t *alloc_dmio_job(stolearn_t *stl, job_type_t type, struct bio *bio, bno_t bno_dm, bno_t bno);
 static void dmio_done(unsigned long err, void *context);
 
 static void
 req_dm_io(dmio_job_t *job, int rw)
 {
-	cacheset_t	*ccs = job->ccs;
-	stolearn_t	*stl = ccs->stl;
+	stolearn_t	*stl = job->stl;
 	struct dm_io_request	iorq;
 	struct page_list	pagelist;
 
@@ -225,7 +226,7 @@ jobs_exit(void)
 static void
 job_free(dmio_job_t *job)
 {
-	stolearn_t	*stl = job->ccs->stl;
+	stolearn_t	*stl = job->stl;
 
 	mempool_free(job, job_pool);
 	if (atomic_dec_and_test(&stl->nr_jobs))
@@ -276,10 +277,10 @@ static void
 dmio_done(unsigned long err, void *context)
 {
 	dmio_job_t	*job = (dmio_job_t *)context;
-	cacheset_t	*ccs = job->ccs;
-	stolearn_t	*stl = ccs->stl;
+	stolearn_t	*stl = job->stl;
+	cacheset_t	*mcs = &stl->mcacheset;
 	bno_t		bno = job->bno;
-	cacheinfo_t	*ci = ccs->cacheinfos + bno;
+	cacheinfo_t	*ci = mcs->cacheinfos + bno;
 	struct bio	*bio;
 	unsigned long	flags;
 
@@ -303,11 +304,11 @@ dmio_done(unsigned long err, void *context)
 	else {
 		spin_unlock_irqrestore(&stl->lock, flags);
 		if (job->type == READ_BACKINGDEV)
-			copy_bio_to_pcache(ccs, bio, bno, false);
+			copy_bio_to_pcache(mcs, bio, bno, false);
 		else {
 			if (bio)
 				bio_endio(bio);
-			complete_cacheinfo(ccs, bno, 0, false);
+			complete_cacheinfo(mcs, bno, 0, false);
 		}
 	}
 
@@ -400,14 +401,12 @@ do_writeback_async(struct work_struct *work)
 }
 
 static void
-writeback(cacheset_t *ccs, cacheinfo_t *ci, bno_t bno)
+writeback_mcb(stolearn_t *stl, cacheinfo_t *ci, bno_t bno)
 {
-	stolearn_t	*stl = ccs->stl;
 	dmio_job_t	*job;
 
-	job = alloc_dmio_job(ccs, NULL, ci->bno, bno);
+	job = alloc_dmio_job(stl, WRITE_BACKINGDEV, NULL, ci->bno, bno);
 	if (likely(job)) {
-		job->type = WRITE_BACKINGDEV;
 		atomic_inc(&stl->nr_jobs);
 		stl->disk_writes++;
 
@@ -440,7 +439,7 @@ find_reclaim_mcb(stolearn_t *stl, bno_t bno_start, bno_t *pbno_reclaimed, unsign
 			if (ci->dirty) {
 				ci->state = INPROG;
 				spin_unlock_irqrestore(&stl->lock, *pflags);
-				writeback(mcs, ci, bno_next);
+				writeback_mcb(stl, ci, bno_next);
 				spin_lock_irqsave(&stl->lock, *pflags);
 			}
 			else {
@@ -487,9 +486,8 @@ again:
 }
 
 static dmio_job_t *
-new_dmio_job(cacheset_t *ccs, struct bio *bio, bno_t bno_dm, bno_t bno)
+new_dmio_job(stolearn_t *stl, job_type_t type, struct bio *bio, bno_t bno_dm, bno_t bno)
 {
-	stolearn_t	*stl = ccs->stl;
 	dmio_job_t	*job;
 
 	job = mempool_alloc(job_pool, GFP_NOIO);
@@ -505,7 +503,8 @@ new_dmio_job(cacheset_t *ccs, struct bio *bio, bno_t bno_dm, bno_t bno)
 		job->dm_iorgn.sector = BNO_TO_SECTOR(stl, bno_dm);
 		job->dm_iorgn.count = stl->block_size;
 	}
-	job->ccs = ccs;
+	job->stl = stl;
+	job->type = type;
 	job->bio = bio;
 	job->bno = bno;
 	job->error = 0;
@@ -514,19 +513,18 @@ new_dmio_job(cacheset_t *ccs, struct bio *bio, bno_t bno_dm, bno_t bno)
 }
 
 static dmio_job_t *
-alloc_dmio_job(cacheset_t *ccs, struct bio *bio, bno_t bno_dm, bno_t bno)
+alloc_dmio_job(stolearn_t *stl, job_type_t type, struct bio *bio, bno_t bno_dm, bno_t bno)
 {
 	dmio_job_t *job;
 
-	job = new_dmio_job(ccs, bio, bno_dm, bno);
+	job = new_dmio_job(stl, type, bio, bno_dm, bno);
 	if (unlikely(!job)) {
-		stolearn_t	*stl = ccs->stl;
 		unsigned long	flags;
 
 		DMERR("failed to allocate job\n");
 
 		spin_lock_irqsave(&stl->lock, flags);
-		ccs->cacheinfos[bno].state = INVALID;
+		stl->mcacheset.cacheinfos[bno].state = INVALID;
 		spin_unlock_irqrestore(&stl->lock, flags);
 
 		if (bio) {
@@ -571,15 +569,12 @@ copy_pcache_to_bio(cacheset_t *ccs, struct bio *bio, bno_t bno)
 }
 
 static void
-mcache_read_fault(cacheset_t *mcs, struct bio *bio, bno_t bno)
+mcache_read_fault(stolearn_t *stl, struct bio *bio, bno_t bno)
 {
 	dmio_job_t	*job;
 
-	job = alloc_dmio_job(mcs, bio, 0, bno);
+	job = alloc_dmio_job(stl, READ_BACKINGDEV, bio, 0, bno);
 	if (likely(job)) {
-		stolearn_t	*stl = mcs->stl;
-
-		job->type = READ_BACKINGDEV;
 		atomic_inc(&stl->nr_jobs);
 		stl->disk_reads++;
 
@@ -619,7 +614,7 @@ mcache_read(stolearn_t *stl, struct bio *bio)
 
 	spin_unlock_irqrestore(&stl->lock, flags);
 
-	mcache_read_fault(mcs, bio, bno);
+	mcache_read_fault(stl, bio, bno);
 }
 
 static void
@@ -690,7 +685,7 @@ writeback_all_dirty(cacheset_t *ccs)
 			ci->state = INPROG;
 			spin_unlock_irqrestore(&stl->lock, flags);
 
-			writeback(ccs, ci, i);
+			writeback_mcb(stl, ci, i);
 			spin_lock_irqsave(&stl->lock, flags);
 		}
 	}
