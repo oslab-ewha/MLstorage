@@ -314,16 +314,15 @@ dmio_done(unsigned long err, void *context)
 		}
 	}
 
-	spin_lock_irqsave(&stl->lock, flags);
-
 	if (job->type == READ_CACHINGDEV_PAGE) {
 		job->type = WRITE_BACKINGDEV;
 		job->dm_iorgn.bdev = stl->dev_backing->bdev;
 		job->dm_iorgn.sector = BNO_TO_SECTOR(stl, job->bno_db);
 		queue_work(wq_writeback, &job->work);
-		spin_unlock_irqrestore(&stl->lock, flags);
 		return;
 	}
+
+	spin_lock_irqsave(&stl->lock, flags);
 
 	dci = stl->dcacheset.cacheinfos + job->bno_dcb;
 
@@ -482,7 +481,9 @@ writeback_mcb(cacheset_t *mcs, cacheinfo_t *ci, bno_t bno_mcb, unsigned long *pf
 	dci->bno = ci->bno;
 	dci->state = INPROG;
 
+	spin_unlock_irqrestore(&stl->lock, *pflags);
 	job = new_dmio_job(stl, WRITE_CACHINGDEV, NULL, ci->bno, bno_dcb, bno_mcb);
+	spin_lock_irqsave(&stl->lock, *pflags);
 	if (unlikely(!job)) {
 		dci->state = INVALID;
 		wake_up_all(&stl->inprogq);
@@ -503,7 +504,9 @@ writeback_dcb(cacheset_t *dcs, cacheinfo_t *ci, bno_t bno_dcb, unsigned long *pf
 	stolearn_t	*stl = dcs->stl;
 	dmio_job_t	*job;
 
+	spin_unlock_irqrestore(&stl->lock, *pflags);
 	job = new_dmio_job(stl, READ_CACHINGDEV_PAGE, NULL, ci->bno, bno_dcb, 0);
+	spin_lock_irqsave(&stl->lock, *pflags);
 	if (unlikely(!job))
 		return false;
 
@@ -673,10 +676,14 @@ mcache_read_fault(stolearn_t *stl, struct bio *bio, bno_t bno_mcb)
 	if (cache_lookup(dcs, bno_db, &bno_dcb, false, &flags)) {
 		dci = stl->dcacheset.cacheinfos + bno_dcb;
 		dci->n_readers++;
+		spin_unlock_irqrestore(&stl->lock, flags);
 		job = new_dmio_job(stl, READ_CACHINGDEV, bio, 0, bno_dcb, bno_mcb);
+		spin_lock_irqsave(&stl->lock, flags);
 	}
 	else {
+		spin_unlock_irqrestore(&stl->lock, flags);
 		job = new_dmio_job(stl, READ_BACKINGDEV, bio, 0, 0, bno_mcb);
+		spin_lock_irqsave(&stl->lock, flags);
 	}
 
 	if (unlikely(!job)) {
@@ -811,7 +818,7 @@ writeback_all_dirty(cacheset_t *ccs)
 				WAIT_INPROG_EVENT(stl, flags, ci->n_readers == 0);
 			}
 			ci->state = INPROG;
-			writeback_mcb(ccs, ci, i, &flags);
+			ccs->writeback(ccs, ci, i, &flags);
 		}
 	}
 
