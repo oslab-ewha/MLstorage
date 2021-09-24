@@ -861,7 +861,7 @@ init_caches(cacheset_t *ccs)
 {
 	stolearn_t	*stl = ccs->stl;
 	cacheinfo_t	*ci;
-	int	i;
+	unsigned long	i;
 
 	for (i = 0, ci = ccs->cacheinfos; i < ccs->size; i++, ci++) {
 		ci->bno = 0;
@@ -885,7 +885,7 @@ init_cacheset(stolearn_t *stl, cacheset_t *ccs, unsigned long size, unsigned int
 	if (ccs->cacheinfos == NULL)
 		return false;
 
-	ccs->bnos_next = vmalloc((ccs->size >> stl->consecutive_shift) * sizeof(u32));
+	ccs->bnos_next = vmalloc((ccs->size >> stl->consecutive_shift) * sizeof(bno_t));
 	if (ccs->bnos_next == NULL)
 		return false;
 
