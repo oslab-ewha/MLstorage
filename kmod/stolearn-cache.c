@@ -161,7 +161,7 @@ static void
 req_dm_io(dmio_job_t *job, int rw)
 {
 	struct dm_io_request	iorq;
-	static struct page_list	pagelist;
+	struct page_list	pagelist;
 
 	iorq.bi_op = rw;
 	iorq.bi_op_flags = 0;
@@ -383,7 +383,7 @@ writeback(stolearn_t *stl, cacheinfo_t *ci, bno_t bno)
 		atomic_inc(&job->stl->nr_jobs);
 		stl->disk_writes++;
 
-		req_dm_io(job, WRITE);
+		req_dm_io(job, REQ_OP_WRITE);
 	}
 }
 
@@ -547,7 +547,7 @@ cache_read_miss(stolearn_t *stl, struct bio *bio, bno_t bno)
 		atomic_inc(&stl->nr_jobs);
 		stl->disk_reads++;
 
-		req_dm_io(job, READ);
+		req_dm_io(job, REQ_OP_READ);
 	}
 }
 
