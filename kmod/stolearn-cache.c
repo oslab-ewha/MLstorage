@@ -842,7 +842,7 @@ get_max_sectors_by_mem(void)
 	struct sysinfo	si;
 
 	si_meminfo(&si);
-	return (si.totalram * PAGE_SIZE / SECTOR_SIZE / 4);
+	return (si.totalram * PAGE_SIZE / SECTOR_SIZE);
 }
 
 static unsigned long
