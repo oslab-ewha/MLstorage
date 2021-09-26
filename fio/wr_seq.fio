@@ -1,0 +1,15 @@
+[global]
+ioengine=libaio
+iodepth=4
+directory=${DIR}
+
+[wr_seq]
+size=1000m
+bs=64m
+rw=write
+nrfiles=10
+numjobs=3
+disk_util=0
+direct=1
+buffered=0
+loops=10

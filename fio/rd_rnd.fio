@@ -1,0 +1,13 @@
+[rd_rnd]
+directory=${DIR}
+size=1000m
+bs=16m
+rw=randread
+nrfiles=10
+numjobs=3
+direct=1
+ioengine=libaio
+iodepth=4
+disk_util=0
+loops=10
+random_distribution=zipf:1.2
