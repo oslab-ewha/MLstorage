@@ -15,8 +15,6 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 
-VERSION = 7.2.1
-
 ifeq ($(KSRC),)
 	KSRC := /lib/modules/$(shell uname -r)/build
 endif
@@ -27,45 +25,28 @@ endif
 
 MKDIR := mkdir -pv
 CP := cp -v
-DKMSFILES := rapiddisk.c rapiddisk-cache.c dkms.conf Makefile
-DKMSDEST := /usr/src/rapiddisk-$(VERSION)
 
-obj-m += rapiddisk.o
-obj-m += rapiddisk-cache.o
+obj-m += mlstor.o
+
+mlstor-y := mlstor-cache.o pcache.o stolearn.o libstolearn.o
+
+# for kernel debug
+# EXTRA_CFLAGS += -g
 
 all:
 	$(MAKE) -C $(KSRC) M=$(CURDIR)
 
 install: all
 	$(MKDIR) $(DESTDIR)/lib/modules/$(KVER)/kernel/drivers/block/
-	install -o root -g root -m 0755 rapiddisk.ko $(DESTDIR)/lib/modules/$(KVER)/kernel/drivers/block/
-	install -o root -g root -m 0755 rapiddisk-cache.ko $(DESTDIR)/lib/modules/$(KVER)/kernel/drivers/block/
+	install -o root -g root -m 0755 stolearn-nn.ko $(DESTDIR)/lib/modules/$(KVER)/kernel/drivers/block/
+	install -o root -g root -m 0755 stolearn-cache.ko $(DESTDIR)/lib/modules/$(KVER)/kernel/drivers/block/
 	depmod -a
 
 uninstall:
-	rm -f $(DESTDIR)/lib/modules/$(KVER)/kernel/drivers/block/rapiddisk.ko
-	rm -f $(DESTDIR)/lib/modules/$(KVER)/kernel/drivers/block/rapiddisk-cache.ko
+	rm -f $(DESTDIR)/lib/modules/$(KVER)/kernel/drivers/block/stolearn-nn.ko
+	rm -f $(DESTDIR)/lib/modules/$(KVER)/kernel/drivers/block/stolearn-cache.ko
 	depmod -a
 
 clean:
 	rm -rf *.o *.ko *.symvers *.mod.c .*.cmd Module.markers modules.order *.o.* built-in*
-	rm -rf .tmp_versions .rapiddisk.o.d *.unsigned *.sdtinfo.c .ctf/ .cache.mk *.mod
-
-dkms-install: clean uninstall
-ifeq ($(shell which dkms >/dev/null 2>/dev/null; echo $$?),1)
-	$(error No 'dkms' command found)
-else ifeq ($(shell dkms status rapiddisk/$(VERSION) -k $(KVER) | grep '$(KVER)' >/dev/null 2>/dev/null; echo $$?),0)
-	$(error rapiddisk version $(VERSION) is already installed for kernel $(KVER). Use 'make dkms-uninstall' first)
-else
-	dkms add . || true
-	dkms install rapiddisk/$(VERSION) -k $(KVER)
-endif
-
-dkms-uninstall: clean uninstall
-ifeq ($(shell which dkms >/dev/null 2>/dev/null; echo $$?),1)
-	$(error No 'dkms' command found)
-else ifeq ($(shell dkms status rapiddisk/$(VERSION) -k $(KVER) | grep '$(KVER)' >/dev/null 2>/dev/null; echo $$?),0)
-	dkms remove rapiddisk/$(VERSION) -k $(KVER)
-else
-	$(error rapiddisk version $(VERSION) is not installed for kernel $(KVER))
-endif
+	rm -rf .tmp_versions .stolearn.o.d *.unsigned *.sdtinfo.c .ctf/ .cache.mk *.mod
