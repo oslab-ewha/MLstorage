@@ -144,6 +144,9 @@ typedef struct _stolearn {
 	atomic_t		nr_jobs;	/* Number of I/O jobs */
 	wait_queue_head_t	destroyq;	/* Wait queue for I/O completion */
 
+	unsigned long	n_hit_streaks;
+	u64		ns_start_hit_check;
+
 	/* Stats */
 	unsigned long	cache_hits;
 	unsigned long	replace;
@@ -707,6 +710,38 @@ mcache_read_fault(stolearn_t *stl, struct bio *bio, bno_t bno_mcb)
 	return true;
 }
 
+static bool
+force_miss(stolearn_t *stl)
+{
+	unsigned long	metric;
+	u64	ns_cur;
+
+	stl->n_hit_streaks++;
+
+	if (stl->n_hit_streaks == 1) {
+		stl->ns_start_hit_check = ktime_get_ns();
+		return false;
+	}
+
+	ns_cur = ktime_get_ns();
+	if (ns_cur - stl->ns_start_hit_check > 50000000) {
+		stl->ns_start_hit_check = ns_cur;
+		stl->n_hit_streaks = 1;
+		return false;
+	}
+
+	if (stl->n_hit_streaks < 3)
+		return false;
+
+	metric = (stl->n_hit_streaks) * 4096 * 1000000000 / (ns_cur - stl->ns_start_hit_check) / 1024 / 1024;
+	if (metric > 900) {
+		stl->ns_start_hit_check = ns_cur;
+		stl->n_hit_streaks = 1;
+		return true;
+	}
+	return false;
+}
+
 static void
 mcache_read(stolearn_t *stl, struct bio *bio)
 {
@@ -719,6 +754,9 @@ mcache_read(stolearn_t *stl, struct bio *bio)
 	spin_lock_irqsave(&stl->lock, flags);
 
 	if (cache_lookup(mcs, bno_db, &bno_mcb, false, &flags)) {
+		if (1 && force_miss(stl))
+			goto fake_miss;
+
 		mcs->cacheinfos[bno_mcb].n_readers++;
 		stl->cache_hits++;
 		spin_unlock_irqrestore(&stl->lock, flags);
@@ -726,6 +764,10 @@ mcache_read(stolearn_t *stl, struct bio *bio)
 		copy_pcache_to_bio(mcs, bio, bno_mcb);
 		return;
 	}
+	else {
+		stl->n_hit_streaks = 0;
+	}
+fake_miss:
 
 	ci = mcs->cacheinfos + bno_mcb;
 
@@ -926,7 +968,7 @@ init_stolearn(stolearn_t *stl, unsigned long size_mcache, unsigned int assoc)
 	size_dcache = to_sector(stl->dev_caching->bdev->bd_inode->i_size);
 	max_sectors_bymem = get_max_sectors_by_mem();
 	if (size_mcache == 0)
-		size_mcache = size_dcache;
+		size_mcache = size_dcache * 4;
 	if (size_mcache > max_sectors_bymem)
 		size_mcache = max_sectors_bymem;
 
