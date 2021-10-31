@@ -116,6 +116,7 @@ typedef struct _cacheset {
 	unsigned long	size;
 	writeback_t	writeback;
 	cacheinfo_t	*cacheinfos;
+	unsigned long	n_valids;
 	/* next bno per set for validity test */
 	bno_t	*bnos_next;
 } cacheset_t;
@@ -153,7 +154,7 @@ typedef struct _stolearn {
 	unsigned long	cached_blocks;
 	unsigned long	cache_wr_replace;
 	unsigned long	cache_reads, cache_writes;
-	unsigned long	disk_reads, disk_writes;
+	unsigned long	disk_reads, disk_writes, disk_writes1, reclaims;
 
 	char	devname_backing[DEV_PATHLEN];
 	char	devname_caching[DEV_PATHLEN];
@@ -278,8 +279,10 @@ copy_bio_to_pcache(cacheset_t *mcs, struct bio *bio, bno_t bno_mcb)
 
 	if (err != 0) {
 		mci->state = INVALID;
+		mcs->n_valids--;
 	} else {
 		mci->state = VALID;
+		mcs->n_valids++;
 		mci->dirty = true;
 		stl->cached_blocks++;
 	}
@@ -351,10 +354,12 @@ dmio_done(unsigned long err, void *context)
 
 		if (partial_blk || err != 0) {
 			mci->state = INVALID;
+			mcs->n_valids--;
 			if (job->type == WRITE_CACHINGDEV)
 				dci->state = INVALID;
 		} else {
 			mci->state = VALID;
+			mcs->n_valids++;
 			mci->dirty = false;
 			if (job->type == WRITE_CACHINGDEV) {
 				dci->state = VALID;
@@ -514,7 +519,7 @@ writeback_dcb(cacheset_t *dcs, cacheinfo_t *ci, bno_t bno_dcb, unsigned long *pf
 		return false;
 
 	atomic_inc(&stl->nr_jobs);
-	stl->disk_writes++;
+	stl->disk_writes1++;
 	INIT_WORK(&job->work, do_dmio_async);
 	queue_work(wq_writeback, &job->work);
 
@@ -544,9 +549,11 @@ find_reclaim_cb(cacheset_t *ccs, bno_t bno_start, bno_t *pbno_reclaimed, unsigne
 		if (ci->state == VALID && ci->n_readers == 0) {
 			if (ci->dirty) {
 				ci->state = INPROG;
+				ccs->n_valids--;
 				if (!ccs->writeback(ccs, ci, bno_next, pflags)) {
 					/* revert to */
 					ci->state = VALID;
+					ccs->n_valids++;
 				}
 			}
 			else {
@@ -585,6 +592,7 @@ again:
 			WAIT_INPROG_EVENT(stl, *pflags, has_nonprog_cb(ccs, bno_start));
 			goto again;
 		}
+		stl->reclaims++;
 		*pbno_cb = bno_reclaimed;
 	}
 
@@ -754,7 +762,7 @@ mcache_read(stolearn_t *stl, struct bio *bio)
 	spin_lock_irqsave(&stl->lock, flags);
 
 	if (cache_lookup(mcs, bno_db, &bno_mcb, false, &flags)) {
-		if (1 && force_miss(stl))
+		if (force_miss(stl))
 			goto fake_miss;
 
 		mcs->cacheinfos[bno_mcb].n_readers++;
@@ -775,6 +783,7 @@ fake_miss:
 		/* This means that cache read uses a victim cache */
 		stl->cached_blocks--;
 		stl->replace++;
+		mcs->n_valids--;
 	}
 
 	ci->state = INPROG;
@@ -811,6 +820,7 @@ mcache_write(stolearn_t *stl, struct bio *bio)
 	if (ci->state == VALID) {
 		stl->cached_blocks--;
 		stl->cache_wr_replace++;
+		mcs->n_valids--;
 	}
 
 	ci->state = INPROG;
@@ -859,6 +869,7 @@ writeback_all_dirty(cacheset_t *ccs)
 			while (ci->n_readers > 0) {
 				WAIT_INPROG_EVENT(stl, flags, ci->n_readers == 0);
 			}
+			ccs->n_valids--;
 			ci->state = INPROG;
 			ccs->writeback(ccs, ci, i, &flags);
 		}
@@ -890,7 +901,7 @@ get_max_sectors_by_mem(void)
 static unsigned long
 convert_sectors_to_blocks(stolearn_t *stl, unsigned long sectors)
 {
-	unsigned	tmpsize;
+	unsigned long	tmpsize;
 
 	do_div(sectors, stl->block_size);
 	tmpsize = sectors;
@@ -969,6 +980,7 @@ init_stolearn(stolearn_t *stl, unsigned long size_mcache, unsigned int assoc)
 	max_sectors_bymem = get_max_sectors_by_mem();
 	if (size_mcache == 0)
 		size_mcache = size_dcache * 4;
+
 	if (size_mcache > max_sectors_bymem)
 		size_mcache = max_sectors_bymem;
 
@@ -1146,11 +1158,13 @@ stolearn_status_info(stolearn_t *stl, status_type_t type, char *result, unsigned
 
 	DMEMIT("stats:\n\treads(%lu), writes(%lu)\n", stl->reads, stl->writes);
 	DMEMIT("\tcache hits(%lu), replacement(%lu), write replacement(%lu)\n"
-		"\tdisk reads(%lu), disk writes(%lu)\n"
-		"\tcache reads(%lu), cache writes(%lu)\n",
+		"\tdisk reads(%lu), disk writes(%lu,%lu)\n"
+		"\tcache reads(%lu), cache writes(%lu)\n"
+		"\tn_valids(%lu), reclaims(%lu)\n",
 		stl->cache_hits, stl->replace, stl->cache_wr_replace,
-		stl->disk_reads, stl->disk_writes,
-		stl->cache_reads, stl->cache_writes);
+	       stl->disk_reads, stl->disk_writes, stl->disk_writes1,
+	       stl->cache_reads, stl->cache_writes,
+	       stl->mcacheset.n_valids, stl->reclaims);
 }
 
 static void
