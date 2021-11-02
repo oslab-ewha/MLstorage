@@ -147,6 +147,8 @@ typedef struct _stolearn {
 
 	unsigned long	n_hit_streaks;
 	u64		ns_start_hit_check;
+	unsigned long	n_write_streaks;
+	u64		ns_start_write_check;
 
 	/* Stats */
 	unsigned long	cache_hits;
@@ -719,7 +721,7 @@ mcache_read_fault(stolearn_t *stl, struct bio *bio, bno_t bno_mcb)
 }
 
 static bool
-force_miss(stolearn_t *stl)
+force_read_miss(stolearn_t *stl)
 {
 	unsigned long	metric;
 	u64	ns_cur;
@@ -762,7 +764,7 @@ mcache_read(stolearn_t *stl, struct bio *bio)
 	spin_lock_irqsave(&stl->lock, flags);
 
 	if (cache_lookup(mcs, bno_db, &bno_mcb, false, &flags)) {
-		if (force_miss(stl))
+		if (force_read_miss(stl))
 			goto fake_miss;
 
 		mcs->cacheinfos[bno_mcb].n_readers++;
@@ -803,6 +805,41 @@ fake_miss:
 }
 
 static void
+throttle_write(stolearn_t *stl, unsigned long *pflags)
+{
+	u64	ns_cur;
+
+	stl->n_write_streaks++;
+
+	if (stl->n_write_streaks == 1) {
+		stl->ns_start_write_check = ktime_get_ns();
+		return;
+	}
+
+	ns_cur = ktime_get_ns();
+	if (ns_cur - stl->ns_start_write_check > 1000000) {
+		stl->ns_start_write_check = ns_cur;
+		stl->n_write_streaks = 1;
+		return;
+	}
+
+	while (true) {
+		if (ns_cur > stl->ns_start_write_check) {
+			unsigned long	metric;
+
+			metric = stl->n_write_streaks * 4096 * 1000000000 / (ns_cur - stl->ns_start_write_check) / 1024 / 1024;
+			if (metric < 175)
+				break;
+		}
+
+		spin_unlock_irqrestore(&stl->lock, *pflags);
+		yield();
+		spin_lock_irqsave(&stl->lock, *pflags);
+		ns_cur = ktime_get_ns();
+	}
+}
+
+static void
 mcache_write(stolearn_t *stl, struct bio *bio)
 {
 	cacheset_t	*mcs = &stl->mcacheset;
@@ -812,6 +849,8 @@ mcache_write(stolearn_t *stl, struct bio *bio)
 	unsigned long	flags;
 
 	spin_lock_irqsave(&stl->lock, flags);
+
+	throttle_write(stl, &flags);
 
 	cache_lookup(mcs, bno_db, &bno_mcb, true, &flags);
 
