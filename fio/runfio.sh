@@ -5,6 +5,7 @@ function usage() {
 Usage: runfio.sh [options] [<fio script>]
 options>
  -o <output path>: output file path for summary(required)
+ -t <type>: sshd or mlstor
  -h: this message
 
   all *.fio would be executed if no script is privieded
@@ -12,18 +13,21 @@ EOF
 }
 
 FIO=fio
-N_TRYS=4
+N_TRYS=3
 
 MNT_SSHD=${MNT_SSHD:-/data.sshd}
 MNT_MLSTOR=${MNT_MLSTOR:-/data.mlstor}
 
 trap cleanup 1 2 15
 
-while getopts "o:h" arg
+while getopts "o:t:h" arg
 do
     case $arg in
 	o)
 	    output=$OPTARG
+	    ;;
+	t)
+	    type=$OPTARG
 	    ;;
 	h)
 	    usage
@@ -105,13 +109,20 @@ Run benchmark test for $script
 **************************************************
 
 EOF
-    run_fio sshd
-    perf_sshd=$v
-    run_fio MLstorage
-    perf_mlstor=$v
+    if [[ -z $type ]]; then
+	run_fio sshd
+	perf_sshd=$v
+	run_fio mlstor
+	perf_mlstor=$v
 
-    perfup=`echo "scale=10; (($perf_mlstor - $perf_sshd) / $perf_sshd) * 100" | bc`
-    printf "%16s %17s %17s %15.1f\n" $script $perf_sshd $perf_mlstor $perfup >> $output
+	perfup=`echo "scale=10; (($perf_mlstor - $perf_sshd) / $perf_sshd) * 100" | bc`
+	printf "%16s %17s %17s %15.1f\n" $script $perf_sshd $perf_mlstor $perfup >> $output
+    else
+	run_fio $type
+	perf=$v
+
+	printf "%16s %17s %17s\n" $script $perf >> $output
+    fi
 }
 
 if [[ -z $output ]]; then
@@ -119,7 +130,13 @@ if [[ -z $output ]]; then
     exit 1
 fi
 
-printf "#%15s %17s %17s %15s\n" script 'sshd(MiB/s)' 'MLStorage(MiB/s)' 'PerfUp(%)' >> $output
+if [[ -z $type ]]; then
+    printf "#%15s %17s %17s %15s\n" script 'sshd(MiB/s)' 'MLStorage(MiB/s)' 'PerfUp(%)' >> $output
+elif [[ $type = "sshd" ]]; then
+    printf "#%15s %17s\n" script 'sshd(MiB/s)' >> $output
+else
+    printf "#%15s %17s\n" script 'MLStorage(MiB/s)' >> $output
+fi
 
 if [[ $# -eq 0 ]]; then
     for script in `ls *.fio`
