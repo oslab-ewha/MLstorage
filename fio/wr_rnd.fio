@@ -4,12 +4,12 @@ iodepth=4
 directory=${DIR}
 
 [wr_rnd]
-size=1000m
+size=1g
 bs=16m
 rw=randwrite
-nrfiles=10
+nrfiles=8
 numjobs=3
 disk_util=0
 direct=1
 buffered=0
-loops=10
+loops=1

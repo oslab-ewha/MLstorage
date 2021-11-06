@@ -7,17 +7,17 @@ disk_util=0
 random_distribution=zipf:1.2
 
 [wr_mix_seq]
-size=1000m
+size=1g
 bs=16m
 rw=write
-nrfiles=10
+nrfiles=8
 numjobs=2
-loops=10
+loops=1
 
 [wr_mix_rnd]
-size=1000m
+size=1g
 bs=16m
 rw=randwrite
-nrfiles=10
+nrfiles=8
 numjobs=2
-loops=10
+loops=1
