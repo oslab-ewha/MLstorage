@@ -1,13 +1,13 @@
 [rd_rnd]
 directory=${DIR}
-size=1000m
+size=1g
 bs=16m
 rw=randread
-nrfiles=10
+nrfiles=8
 numjobs=3
 direct=1
 ioengine=libaio
 iodepth=4
 disk_util=0
-loops=10
+loops=1
 random_distribution=zipf:1.2
