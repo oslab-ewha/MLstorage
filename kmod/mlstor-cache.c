@@ -689,7 +689,7 @@ mcache_read_fault(mlstor_t *mls, struct bio *bio, bno_t bno_mcb)
 }
 
 static bool
-force_read_miss(mlstor_t *mls)
+throttle_read(mlstor_t *mls)
 {
 	unsigned long	metric;
 	u64	ns_cur;
@@ -732,8 +732,8 @@ mcache_read(mlstor_t *mls, struct bio *bio)
 	spin_lock_irqsave(&mls->lock, flags);
 
 	if (cache_lookup(mcs, bno_db, &bno_mcb, false, &flags)) {
-		if (force_read_miss(mls))
-			goto fake_miss;
+		if (throttle_read(mls))
+			goto throttle_miss;
 
 		mcs->cacheinfos[bno_mcb].n_readers++;
 		mls->cache_hits++;
@@ -745,7 +745,7 @@ mcache_read(mlstor_t *mls, struct bio *bio)
 	else {
 		mls->n_hit_streaks = 0;
 	}
-fake_miss:
+throttle_miss:
 
 	ci = mcs->cacheinfos + bno_mcb;
 
