@@ -15,6 +15,7 @@
 #include <linux/mm.h>
 
 #include "pcache.h"
+#include "stolearn.h"
 
 #define ASSERT(x) do { \
 	if (unlikely(!(x))) { \
@@ -93,6 +94,7 @@ typedef struct _cacheset {
 typedef struct _mlstor {
 	struct dm_target	*tgt;
 	struct dm_dev		*dev_backing, *dev_caching;
+	stolearn_t		*stl;
 	pcache_t		*pcache;
 
 	spinlock_t	lock;
@@ -153,6 +155,8 @@ static mempool_t		*job_pool;
 
 /* 5.x kernel seem to halt if a map thread exeucutes directly writeback */
 static struct workqueue_struct	*wq_writeback;
+
+static int	*randidx;
 
 static bool cache_lookup(cacheset_t *ccs, bno_t bno_db, bno_t *pbno_cb, bool for_write, unsigned long *pflags);
 static dmio_job_t *new_dmio_job(mlstor_t *mls, job_type_t type, struct bio *bio, bno_t bno_db, bno_t bno_dcb, bno_t bno_mcb);
@@ -428,9 +432,6 @@ has_nonprog_cb(cacheset_t *ccs, bno_t bno_start)
 	return false;
 }
 
-#define NEXT_BNO(bno, bno_start, bno_end) \
-	((bno) + 1 == (bno_end)) ? (bno_start): ((bno) + 1)
-
 static void
 do_dmio_async(struct work_struct *work)
 {
@@ -496,20 +497,30 @@ writeback_dcb(cacheset_t *dcs, cacheinfo_t *ci, bno_t bno_dcb, unsigned long *pf
 	return true;
 }
 
+static bno_t
+get_next_bno(replace_pol_t repol, bno_t bno, bno_t bno_start, bno_t bno_end)
+{
+	switch (repol) {
+	case REPOL_LRU:
+		return (bno + 1 == bno_end) ? bno_start: bno + 1;
+	case REPOL_MRU:
+		return (bno == 0) ? bno_end: bno - 1;
+	default:
+		return bno_start + randidx[bno + 1];
+	}
+}
+
 static bool
 find_reclaim_cb(cacheset_t *ccs, bno_t bno_start, bno_t *pbno_reclaimed, unsigned long *pflags)
 {
 	mlstor_t	*mls = ccs->mls;
+	replace_pol_t	repol;
 	bno_t	bno_end = bno_start + mls->assoc;
 	int	set = bno_start / mls->assoc;
 	int	slots_searched = 0;
 	bno_t	bno_next;
 
-	/* Find the "oldest" VALID slot to recycle. For each set, we keep
-	 * track of the next "lru" slot to pick off. Each time we pick off
-	 * a VALID entry to recycle we advance this pointer. So  we sweep
-	 * through the set looking for next blocks to recycle. This
-	 * approximates to FIFO (modulo for blocks written through). */
+	repol = stolearn_get_replace_policy(mls->stl);
 	bno_next = ccs->bnos_next[set];
 	while (slots_searched < mls->assoc) {
 		cacheinfo_t	*ci = ccs->cacheinfos + bno_next;
@@ -520,20 +531,22 @@ find_reclaim_cb(cacheset_t *ccs, bno_t bno_start, bno_t *pbno_reclaimed, unsigne
 			if (ci->dirty) {
 				ci->state = INPROG;
 				ccs->n_valids--;
-				if (!ccs->writeback(ccs, ci, bno_next, pflags)) {
-					/* revert to */
-					ci->state = VALID;
-					ccs->n_valids++;
+				if (stolearn_need_writeback(mls->stl)) {
+					if (!ccs->writeback(ccs, ci, bno_next, pflags)) {
+						/* revert to */
+						ci->state = VALID;
+						ccs->n_valids++;
+					}
 				}
 			}
 			else {
 				*pbno_reclaimed = bno_next;
-				ccs->bnos_next[set] = NEXT_BNO(bno_next, bno_start, bno_end);
+				ccs->bnos_next[set] = get_next_bno(repol, bno_next, bno_start, bno_end);
 				return true;
 			}
 		}
 		slots_searched++;
-		bno_next = NEXT_BNO(bno_next, bno_start, bno_end);
+		bno_next = get_next_bno(repol, bno_next, bno_start, bno_end);
 	}
 	return false;
 }
@@ -694,6 +707,9 @@ throttle_read(mlstor_t *mls)
 	unsigned long	metric;
 	u64	ns_cur;
 
+	if (!stolearn_need_throttle_read(mls->stl))
+		return false;
+
 	mls->n_hit_streaks++;
 
 	if (mls->n_hit_streaks == 1) {
@@ -777,6 +793,9 @@ throttle_write(mlstor_t *mls, unsigned long *pflags)
 {
 	u64	ns_cur;
 
+	if (!stolearn_need_throttle_write(mls->stl))
+		return;
+
 	mls->n_write_streaks++;
 
 	if (mls->n_write_streaks == 1) {
@@ -847,6 +866,8 @@ mlstor_map(struct dm_target *ti, struct bio *bio)
 
 	if (bio_barrier(bio))
 		return -EOPNOTSUPP;
+
+	stolearn_add_bio(mls->stl, bio);
 
 	ASSERT(to_sector(bio->bi_iter.bi_size) <= mls->block_size);
 	if (bio_data_dir(bio) == READ)
@@ -1016,6 +1037,8 @@ free_mlstor(mlstor_t *mls)
 	free_cacheset(&mls->mcacheset);
 	free_cacheset(&mls->dcacheset);
 
+	if (mls->stl)
+		free_stolearn(mls->stl);
 	if (mls->pcache)
 		pcache_delete(mls->pcache);
 	if (mls->io_client)
@@ -1101,6 +1124,17 @@ mlstor_ctr(struct dm_target *tgt, unsigned int argc, char **argv)
 		return err;
 	}
 
+	mls->stl = create_stolearn(to_sector(mls->dev_backing->bdev->bd_inode->i_size));
+	if (mls->stl == NULL) {
+		tgt->error = "failed to initialize stolearn\n";
+		free_mlstor(mls);
+		return -EIO;
+	}
+	if (mls->pcache == NULL) {
+		tgt->error = "failed to create pcache\n";
+		free_mlstor(mls);
+		return -ENOMEM;
+	}
 	mls->pcache = pcache_create();
 	if (mls->pcache == NULL) {
 		tgt->error = "failed to create pcache\n";
