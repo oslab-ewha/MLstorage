@@ -14,7 +14,7 @@ function get_sectors() {
 
 function create_mlstor() {
     sectors=`get_sectors $1`
-    echo "0 $sectors stolearn-cache $1 $2" | dmsetup create $3 >& /dev/null
+    echo "0 $sectors mlstor-cache $1 $2" | dmsetup create $3 >& /dev/null
     if [[ $? -ne 0 ]]; then
 	echo "failed to create MLstorage: $3"
 	exit 2

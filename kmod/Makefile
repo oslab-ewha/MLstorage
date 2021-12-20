@@ -28,7 +28,7 @@ CP := cp -v
 
 obj-m += mlstor.o
 
-mlstor-y := stolearn-cache.o pcache.o
+mlstor-y := mlstor-cache.o pcache.o
 
 # for kernel debug
 # EXTRA_CFLAGS += -g
