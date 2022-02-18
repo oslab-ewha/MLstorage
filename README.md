@@ -8,6 +8,7 @@ which controls storage policy based on estimated IO access pattern.
 - enter `kmod` directory and just `make`
   - The kernel module will be built against a current kernel version.
   - If you try to build with another version, please define `KSRC` environment variable
+  - Linux source headers should be installed before build starts.
 - If build succeeds, `kmod/mlstor.ko` will be generated.
 
 ## Run
