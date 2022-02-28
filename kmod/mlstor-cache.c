@@ -1,18 +1,7 @@
-#include <linux/atomic.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/blkdev.h>
-#include <linux/bio.h>
-#include <linux/vmalloc.h>
-#include <linux/slab.h>
-#include <linux/spinlock.h>
-#include <linux/workqueue.h>
-#include <linux/version.h>
-#include <linux/seq_file.h>
-#include <linux/hardirq.h>
-#include <linux/dm-io.h>
 #include <linux/device-mapper.h>
-#include <linux/mm.h>
+
+#include "mlstor-cache.h"
+#include "dmio-job.h"
 
 #define ASSERT(x) do { \
 	if (unlikely(!(x))) { \
@@ -22,7 +11,6 @@
 	} \
 } while (0)
 
-#define VERSION_STR	"1.0.0"
 #define DM_MSG_PREFIX	"mlstor-cache"
 
 #define BYTES_PER_BLOCK		512
@@ -31,108 +19,11 @@
 #define CACHE_BLOCK_SIZE	(PAGE_SIZE / BYTES_PER_BLOCK)
 #define CONSECUTIVE_BLOCKS	512
 
-#define DEV_PATHLEN	128
-
 #ifndef DM_MAPIO_SUBMITTED
 #define DM_MAPIO_SUBMITTED	0
 #endif
 
-#define WT_MIN_JOBS	1024
-/* Number of pages for I/O */
-
-#define INVALID_BNO	((bno_t)(-1))
-#define IS_VALID_BNO(bno)	((bno) != INVALID_BNO)
-
-typedef unsigned long	bno_t;
-
 #define IS_FULL_BIO(mls, bio)	(to_sector((bio)->bi_iter.bi_size) == (mls)->block_size)
-
-typedef enum {
-	READ_BACKINGDEV = 1,
-	READ_BACKINGDEV_WC,	/* read backing device and write cache */
-	READ_CACHINGDEV_WB,
-	WRITE_BACKINGDEV,
-	WRITE_BACKINGDEV_WB,
-	READ_CACHINGDEV,
-	WRITE_CACHINGDEV
-} job_type_t;
-
-#define IS_WRITE_JOB_TYPE(job_type)	((job_type) == WRITE_BACKINGDEV || (job_type) == WRITE_CACHINGDEV || \
-					 (job_type) == WRITE_BACKINGDEV_WB)
-
-/* States of a cache block */
-typedef enum {
-	INVALID = 0,
-	VALID,
-	INPROG	/* IO (cache fill) is in progress */
-} cache_state_t;
-
-#define SECTOR_TO_BNO(mls, sector)	((sector) >> (mls)->block_shift)
-#define BNO_TO_SECTOR(mls, bno)		((bno) << (mls)->block_shift)
-
-/* Cache block metadata structure */
-#pragma pack(push, 1)
-typedef struct _cacheinfo {
-	bno_t	bno;		/* block number, index of the cached block */
-	u8	n_readers;
-	cache_state_t	state:6;
-	bool	dirty:1;
-	bool	writeback:1;
-} cacheinfo_t;
-#pragma pack(pop)
-
-typedef struct _cacheset {
-	unsigned long	size;
-	cacheinfo_t	*cacheinfos;
-	/* next bno per set for validity test */
-	bno_t	*bnos_next;
-} cacheset_t;
-
-/* mlstor */
-typedef struct _mlstor {
-	struct dm_target	*tgt;
-	struct dm_dev		*dev_backing, *dev_caching;
-
-	spinlock_t	lock;
-	/* Wait queue for INPROG state completion */
-	wait_queue_head_t	inprogq;
-
-	cacheset_t	cacheset;
-
-	struct dm_io_client	*io_client;
-
-	unsigned long	reads, writes;
-	unsigned int	assoc;
-	unsigned int	block_size;
-	unsigned int	block_shift;
-	unsigned int	consecutive_shift;
-
-	atomic_t		nr_jobs;	/* Number of I/O jobs */
-	wait_queue_head_t	destroyq;	/* Wait queue for I/O completion */
-
-	/* Stats */
-	unsigned long	cache_hits;
-	unsigned long	replace;
-	unsigned long	cached_blocks;
-	unsigned long	cache_wr_replace;
-	unsigned long	cache_reads, cache_writes;
-	unsigned long	disk_reads, disk_writes, disk_writes1, reclaims;
-
-	char	devname_backing[DEV_PATHLEN];
-	char	devname_caching[DEV_PATHLEN];
-} mlstor_t;
-
-/* DM I/O job */
-typedef struct _dmio_job {
-	job_type_t	type;
-	mlstor_t	*mls;
-	struct page	*page;
-	struct bio	*bio;	/* Original bio */
-	struct dm_io_region	dm_iorgn;
-	bno_t	bno_db, bno_cb;
-	int	error;
-	struct work_struct	work;
-} dmio_job_t;
 
 #define WAIT_INPROG_EVENT(mls, flags, cond)	do {		\
 		spin_unlock_irqrestore(&(mls)->lock, flags);	\
@@ -140,108 +31,17 @@ typedef struct _dmio_job {
 		spin_lock_irqsave(&(mls)->lock, flags);		\
 	} while (0)
 
-static struct kmem_cache	*job_cache;
-static mempool_t		*job_pool;
-
-/* 5.x kernel seem to halt if a map thread exeucutes directly writeback */
-static struct workqueue_struct	*wq_dmio_job;
-
-static dmio_job_t *new_dmio_job(mlstor_t *mls, job_type_t type, struct bio *bio, bno_t bno_db, bno_t bno_cb);
-static void dmio_done(unsigned long err, void *context);
-
-static void
-req_dmio_job(dmio_job_t *job)
-{
-	mlstor_t	*mls = job->mls;
-	struct dm_io_request	iorq;
-	struct page_list	pagelist;
-
-	iorq.bi_op = IS_WRITE_JOB_TYPE(job->type) ? REQ_OP_WRITE: REQ_OP_READ;
-	iorq.bi_op_flags = 0;
-	if (job->bio) {
-		iorq.mem.type = DM_IO_BIO;
-		iorq.mem.ptr.bio = job->bio;
-	}
-	else {
-		pagelist.next = NULL;
-
-		if (job->type == READ_CACHINGDEV_WB)
-			pagelist.page = job->page = alloc_page(GFP_NOIO);
-		else if (job->type == WRITE_BACKINGDEV_WB)
-			pagelist.page = job->page;
-
-		iorq.mem.type = DM_IO_PAGE_LIST;
-		iorq.mem.offset = 0;
-		iorq.mem.ptr.pl = &pagelist;
-	}
-	iorq.notify.fn = dmio_done;
-	iorq.notify.context = job;
-	iorq.client = mls->io_client;
-
-	dm_io(&iorq, 1, &job->dm_iorgn, NULL);
-}
-
-static void
-do_req_dmio_job_async(struct work_struct *work)
-{
-	dmio_job_t	*job = container_of(work, dmio_job_t, work);
-	req_dmio_job(job);
-}
-
-static void
-req_dmio_job_async(dmio_job_t *job)
-{
-	INIT_WORK(&job->work, do_req_dmio_job_async);
-	queue_work(wq_dmio_job, &job->work);
-}
-
-static int
-jobs_init(void)
-{
-	job_cache = kmem_cache_create("dmio-jobs", sizeof(dmio_job_t), __alignof__(dmio_job_t), 0, NULL);
-	if (!job_cache)
-		return -ENOMEM;
-
-	job_pool = mempool_create(WT_MIN_JOBS, mempool_alloc_slab, mempool_free_slab, job_cache);
-	if (!job_pool) {
-		kmem_cache_destroy(job_cache);
-		return -ENOMEM;
-	}
-	return 0;
-}
-
-static void
-jobs_exit(void)
-{
-	mempool_destroy(job_pool);
-	kmem_cache_destroy(job_cache);
-	job_pool = NULL;
-	job_cache = NULL;
-}
-
-static void
-job_free(dmio_job_t *job)
-{
-	mlstor_t	*mls = job->mls;
-
-	if (job->page)
-		__free_page(job->page);
-	mempool_free(job, job_pool);
-	if (atomic_dec_and_test(&mls->nr_jobs))
-		wake_up(&mls->destroyq);
-}
-
-static void
-update_cache_state(mlstor_t *mls, dmio_job_t *job, unsigned long err)
+void
+update_cache_state(mlstor_t *mls, job_type_t job_type, bno_t bno_cb, unsigned long err)
 {
 	cacheinfo_t	*ci;
 	unsigned long	flags;
 
 	spin_lock_irqsave(&mls->lock, flags);
 
-	ci = mls->cacheset.cacheinfos + job->bno_cb;
+	ci = mls->cacheset.cacheinfos + bno_cb;
 
-	switch (job->type) {
+	switch (job_type) {
 	case READ_CACHINGDEV:
 	case READ_CACHINGDEV_WB:
 		ASSERT(ci->n_readers > 0);
@@ -252,7 +52,7 @@ update_cache_state(mlstor_t *mls, dmio_job_t *job, unsigned long err)
 	}
 
 	if (err == 0) {
-		switch (job->type) {
+		switch (job_type) {
 		case WRITE_BACKINGDEV_WB:
 			ci->dirty = false;
 			ci->writeback = false;
@@ -266,7 +66,7 @@ update_cache_state(mlstor_t *mls, dmio_job_t *job, unsigned long err)
 		}
 	}
 	else {
-		switch (job->type) {
+		switch (job_type) {
 		case WRITE_CACHINGDEV:
 			ci->state = INVALID;
 			break;
@@ -278,50 +78,6 @@ update_cache_state(mlstor_t *mls, dmio_job_t *job, unsigned long err)
 	wake_up_all(&mls->inprogq);
 
 	spin_unlock_irqrestore(&mls->lock, flags);
-}
-
-static void
-dmio_done(unsigned long err, void *context)
-{
-	dmio_job_t	*job = (dmio_job_t *)context;
-	mlstor_t	*mls = job->mls;
-	struct bio	*bio;
-
-	bio = job->bio;
-	if (err) {
-		DMERR("%s: job_type: %d, io error: %ld", __func__, job->type, err);
-	}
-
-	if (IS_VALID_BNO(job->bno_cb))
-		update_cache_state(mls, job, err);
-
-	if (err == 0) {
-		if (job->type == READ_CACHINGDEV_WB) {
-			job->type = WRITE_BACKINGDEV_WB;
-			job->dm_iorgn.bdev = mls->dev_backing->bdev;
-			job->dm_iorgn.sector = BNO_TO_SECTOR(mls, job->bno_db);
-			req_dmio_job_async(job);
-			return;
-		}
-		else if (job->type == READ_BACKINGDEV_WC) {
-			job->type = WRITE_CACHINGDEV;
-			job->dm_iorgn.bdev = mls->dev_caching->bdev;
-			job->dm_iorgn.sector = BNO_TO_SECTOR(mls, job->bno_cb);
-			req_dmio_job_async(job);
-			return;
-		}
-	}
-
-	if (bio) {
-		if (err) {
-			bio->bi_status = err;
-			bio_io_error(bio);
-		}
-		else
-			bio_endio(bio);
-	}
-
-	job_free(job);
 }
 
 static unsigned long
@@ -481,47 +237,6 @@ again:
 	}
 
 	return false;
-}
-
-static dmio_job_t *
-new_dmio_job(mlstor_t *mls, job_type_t type, struct bio *bio, bno_t bno_db, bno_t bno_cb)
-{
-	dmio_job_t	*job;
-
-	job = mempool_alloc(job_pool, GFP_NOIO);
-	if (job == NULL) {
-		DMERR("failed to allocate job\n");
-		return NULL;
-	}
-
-	if (type == READ_CACHINGDEV || type == WRITE_CACHINGDEV || type == READ_CACHINGDEV_WB) {
-		job->dm_iorgn.bdev = mls->dev_caching->bdev;
-		job->dm_iorgn.sector = BNO_TO_SECTOR(mls, bno_cb);
-		if (bio) {
-			job->dm_iorgn.sector += (bio->bi_iter.bi_sector % mls->block_size);
-			job->dm_iorgn.count = to_sector(bio->bi_iter.bi_size);
-		}
-		else {
-			job->dm_iorgn.count = mls->block_size;
-		}
-	}
-	else {
-		job->dm_iorgn.bdev = mls->dev_backing->bdev;
-		job->dm_iorgn.sector = bio->bi_iter.bi_sector;
-		job->dm_iorgn.count = to_sector(bio->bi_iter.bi_size);
-	}
-
-	job->mls = mls;
-	job->type = type;
-	job->bio = bio;
-	job->bno_db = bno_db;
-	job->bno_cb = bno_cb;
-	job->error = 0;
-	job->page = NULL;
-
-	atomic_inc(&mls->nr_jobs);
-
-	return job;
 }
 
 static void
@@ -991,43 +706,19 @@ static struct target_type	mlstor_target = {
 	.status  = mlstor_status,
 };
 
-int __init
-rc_init(void)
+bool
+mlstor_cache_init(void)
 {
-	int ret;
-
-	ret = jobs_init();
-	if (ret)
-		return ret;
-
-	wq_dmio_job = create_singlethread_workqueue("async_dmio");
-	if (wq_dmio_job == NULL) {
-		jobs_exit();
-		return -ENOMEM;
-	}
+	int	ret;
 
 	ret = dm_register_target(&mlstor_target);
-	if (ret < 0) {
-		jobs_exit();
-		destroy_workqueue(wq_dmio_job);
-		return ret;
-	}
-	return 0;
+	if (ret < 0)
+		return false;
+	return true;
 }
 
 void
-rc_exit(void)
+mlstor_cache_fini(void)
 {
 	dm_unregister_target(&mlstor_target);
-	destroy_workqueue(wq_dmio_job);
-	jobs_exit();
 }
-
-module_init(rc_init);
-module_exit(rc_exit);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("oslab <oslab@oslab.ewha.ac.kr>");
-MODULE_DESCRIPTION("MLStorage-Cache is a machine learning based caching target with NN model.");
-MODULE_VERSION(VERSION_STR);
-MODULE_INFO(Copyright, "Copyleft 2021 OSLAB, Ewha");

@@ -28,7 +28,7 @@ CP := cp -v
 
 obj-m += mlstor.o
 
-mlstor-y := mlstor-cache.o pcache.o
+mlstor-y := mlstor-mod.o mlstor-cache.o dmio-job.o pcache.o
 
 # for kernel debug
 # EXTRA_CFLAGS += -g
