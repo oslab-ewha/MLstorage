@@ -137,7 +137,7 @@ find_invalid_cb(mlstor_t *mls, bno_t bno_start, bno_t *pbno)
 }
 
 static bool
-has_nonprog_cb(mlstor_t *mls, bno_t bno_start)
+has_reclaimable_cb(mlstor_t *mls, bno_t bno_start)
 {
 	bno_t	bno_end = bno_start + mls->assoc;
 	cacheinfo_t	*ci;
@@ -145,9 +145,8 @@ has_nonprog_cb(mlstor_t *mls, bno_t bno_start)
 
 	/* Find INVALID slot that we can reuse */
 	for (i = bno_start, ci = mls->cacheset.cacheinfos + i; i < bno_end; i++, ci++) {
-		if (ci->state != INPROG && ci->n_readers == 0) {
+		if (ci->state == INVALID || (ci->state == VALID && !ci->writeback && ci->n_readers == 0))
 			return true;
-		}
 	}
 	return false;
 }
@@ -229,7 +228,7 @@ again:
 
 		/* We didn't find an invalid entry, search for oldest valid entry */
 		if (!find_reclaim_cb(mls, bno_start, &bno_reclaimed, pflags)) {
-			WAIT_INPROG_EVENT(mls, *pflags, has_nonprog_cb(mls, bno_start));
+			WAIT_INPROG_EVENT(mls, *pflags, has_reclaimable_cb(mls, bno_start));
 			goto again;
 		}
 		mls->reclaims++;
