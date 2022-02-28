@@ -60,8 +60,8 @@ typedef struct _mlstor {
 	unsigned int	block_shift;
 	unsigned int	consecutive_shift;
 
-	atomic_t		nr_jobs;	/* Number of I/O jobs */
-	wait_queue_head_t	destroyq;	/* Wait queue for I/O completion */
+	atomic_t		n_active_jobs;	/* # of active dmio jobs */
+	wait_queue_head_t	job_idleq;	/* wait queue for I/O completion */
 
 	/* Stats */
 	unsigned long	cache_hits;

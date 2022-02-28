@@ -25,6 +25,8 @@ dmio_job_t *new_dmio_job(struct _mlstor *mls, job_type_t type, struct bio *bio, 
 void req_dmio_job(dmio_job_t *job);
 void req_dmio_job_async(dmio_job_t *job);
 
+void jobs_wait_idle(struct _mlstor *mls);
+
 bool jobs_init(void);
 void jobs_exit(void);
 

@@ -27,8 +27,8 @@ free_dmio_job(dmio_job_t *job)
 	if (job->page)
 		__free_page(job->page);
 	mempool_free(job, job_pool);
-	if (atomic_dec_and_test(&mls->nr_jobs))
-		wake_up(&mls->destroyq);
+	if (atomic_dec_and_test(&mls->n_active_jobs))
+		wake_up(&mls->job_idleq);
 }
 
 static void
@@ -157,9 +157,15 @@ new_dmio_job(mlstor_t *mls, job_type_t type, struct bio *bio, bno_t bno_db, bno_
 	job->error = 0;
 	job->page = NULL;
 
-	atomic_inc(&mls->nr_jobs);
+	atomic_inc(&mls->n_active_jobs);
 
 	return job;
+}
+
+void
+jobs_wait_idle(mlstor_t *mls)
+{
+	wait_event(mls->job_idleq, !atomic_read(&mls->n_active_jobs));
 }
 
 bool

@@ -394,11 +394,8 @@ writeback_all_dirty(mlstor_t *mls)
 	spin_lock_irqsave(&mls->lock, flags);
 
 	for (i = 0, ci = cs->cacheinfos; i < cs->size; i++, ci++) {
-		while (ci->state == VALID && ci->dirty) {
-			if (ci->n_readers > 0 || ci->writeback) {
-				WAIT_INPROG_EVENT(mls, flags, ci->n_readers == 0 && !ci->writeback);
-				continue;
-			}
+		if (ci->state == VALID && ci->dirty) {
+			ASSERT(ci->n_readers == 0 && !ci->writeback);
 			writeback_cb(mls, ci, i, &flags);
 		}
 	}
@@ -474,8 +471,8 @@ init_mlstor(mlstor_t *mls, unsigned long size_cache, unsigned int assoc)
 	unsigned int	consecutive_blocks;
 	sector_t	size_dcache;
 
-	init_waitqueue_head(&mls->destroyq);
-	atomic_set(&mls->nr_jobs, 0);
+	init_waitqueue_head(&mls->job_idleq);
+	atomic_set(&mls->n_active_jobs, 0);
 
 	mls->block_size = CACHE_BLOCK_SIZE;
 	mls->assoc = assoc;
@@ -635,8 +632,11 @@ mlstor_dtr(struct dm_target *ti)
 	mlstor_t	*mls = (mlstor_t *)ti->private;
 	cacheset_t	*cs = &mls->cacheset;
 
+	jobs_wait_idle(mls);
+
 	writeback_all_dirty(mls);
-	wait_event(mls->destroyq, !atomic_read(&mls->nr_jobs));
+
+	jobs_wait_idle(mls);
 
 	if (mls->reads + mls->writes > 0) {
 		DMINFO("stats:\n\treads(%lu), writes(%lu)\n",
