@@ -316,7 +316,14 @@ cache_write(mlstor_t *mls, struct bio *bio)
 
 	spin_lock_irqsave(&mls->lock, flags);
 
-	cache_lookup(mls, bno_db, &bno_cb, true, &flags);
+	if (!cache_lookup(mls, bno_db, &bno_cb, true, &flags)) {
+		if (!IS_FULL_BIO(mls, bio)) {
+			spin_unlock_irqrestore(&mls->lock, flags);
+			job = new_dmio_job(mls, WRITE_BACKINGDEV, bio, bno_db, INVALID_BNO);
+			req_dmio_job(job);
+			return;
+		}
+	}
 
 	ci = cs->cacheinfos + bno_cb;
 
@@ -324,14 +331,7 @@ cache_write(mlstor_t *mls, struct bio *bio)
 		mls->cached_blocks--;
 		mls->cache_wr_replace++;
 	}
-	else {
-		if (!IS_FULL_BIO(mls, bio)) {
-			spin_unlock_irqrestore(&mls->lock, flags);
-			job = new_dmio_job(mls, WRITE_CACHINGDEV, bio, ci->bno, bno_cb);
-			req_dmio_job(job);
-			return;////TODO
-		}
-	}
+
 	ci->state = INPROG;
 	ci->bno = SECTOR_TO_BNO(mls, bio->bi_iter.bi_sector);
 
@@ -414,7 +414,7 @@ init_caches(mlstor_t *mls)
 	unsigned long	i;
 
 	for (i = 0, ci = cs->cacheinfos; i < cs->size; i++, ci++) {
-		ci->bno = 0;
+		ci->bno = INVALID_BNO;
 		ci->n_readers = 0;
 		ci->state = INVALID;
 		ci->dirty = false;
