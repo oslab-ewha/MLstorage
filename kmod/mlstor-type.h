@@ -3,7 +3,6 @@
 
 typedef enum {
 	READ_BACKINGDEV = 1,
-	READ_BACKINGDEV_WC,	/* read backing device and write cache */
 	READ_CACHINGDEV_WB,
 	WRITE_BACKINGDEV,
 	WRITE_BACKINGDEV_WB,

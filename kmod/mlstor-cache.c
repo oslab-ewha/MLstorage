@@ -238,35 +238,20 @@ again:
 	return false;
 }
 
-static void
-read_backingdev(mlstor_t *mls, struct bio *bio)
+static bool
+read_backingdev(mlstor_t *mls, struct bio *bio, bno_t bno_cb)
 {
 	dmio_job_t	*job;
 	bno_t	bno_db = SECTOR_TO_BNO(mls, bio->bi_iter.bi_sector);
 
-	job = new_dmio_job(mls, READ_BACKINGDEV, bio, bno_db, INVALID_BNO);
+	job = new_dmio_job(mls, READ_BACKINGDEV, bio, bno_db, bno_cb);
 	if (unlikely(!job)) {
 		bio->bi_status = -EIO;
 		bio_io_error(bio);
-		return;
+		return false;
 	}
 	mls->disk_reads++;
 	req_dmio_job(job);
-}
-
-static bool
-cache_read_fault(mlstor_t *mls, struct bio *bio, bno_t bno_cb)
-{
-	dmio_job_t	*job;
-	bno_t	bno_db = SECTOR_TO_BNO(mls, bio->bi_iter.bi_sector);
-
-	job = new_dmio_job(mls, READ_BACKINGDEV_WC, bio, bno_db, bno_cb);
-	if (unlikely(!job))
-		return false;
-
-	mls->disk_reads++;
-	req_dmio_job(job);
-
 	return true;
 }
 
@@ -293,33 +278,29 @@ cache_read(mlstor_t *mls, struct bio *bio)
 		return;
 	}
 
-	if (IS_FULL_BIO(mls, bio)) {
-		ci = cs->cacheinfos + bno_cb;
-
-		if (ci->state == VALID) {
-			/* This means that cache read uses a victim cache */
-			mls->cached_blocks--;
-			mls->replace++;
-		}
-
-		ci->state = INPROG;
-		ci->bno = SECTOR_TO_BNO(mls, bio->bi_iter.bi_sector);
-
+	if (!IS_FULL_BIO(mls, bio)) {
 		spin_unlock_irqrestore(&mls->lock, flags);
-
-		if (!cache_read_fault(mls, bio, bno_cb)) {
-			spin_lock_irqsave(&mls->lock, flags);
-			ci->state = INVALID;
-			wake_up_all(&mls->inprogq);
-			spin_unlock_irqrestore(&mls->lock, flags);
-
-			bio->bi_status = -EIO;
-			bio_io_error(bio);
-		}
+		read_backingdev(mls, bio, INVALID_BNO);
+		return;
 	}
-	else {
+
+	ci = cs->cacheinfos + bno_cb;
+	if (ci->state == VALID) {
+		/* This means that cache read uses a victim cache */
+		mls->cached_blocks--;
+		mls->replace++;
+	}
+
+	ci->state = INPROG;
+	ci->bno = SECTOR_TO_BNO(mls, bio->bi_iter.bi_sector);
+
+	spin_unlock_irqrestore(&mls->lock, flags);
+
+	if (!read_backingdev(mls, bio, bno_cb)) {
+		spin_lock_irqsave(&mls->lock, flags);
+		ci->state = INVALID;
+		wake_up_all(&mls->inprogq);
 		spin_unlock_irqrestore(&mls->lock, flags);
-		read_backingdev(mls, bio);
 	}
 }
 

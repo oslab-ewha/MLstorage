@@ -54,7 +54,7 @@ dmio_done(unsigned long err, void *context)
 			req_dmio_job_async(job);
 			return;
 		}
-		else if (job->type == READ_BACKINGDEV_WC) {
+		else if (job->type == READ_BACKINGDEV && IS_VALID_BNO(job->bno_cb)) {
 			job->type = WRITE_CACHINGDEV;
 			job->dm_iorgn.bdev = mls->dev_caching->bdev;
 			job->dm_iorgn.sector = BNO_TO_SECTOR(mls, job->bno_cb);
