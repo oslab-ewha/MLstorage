@@ -46,6 +46,7 @@ update_cache_state(mlstor_t *mls, job_type_t job_type, bno_t bno_cb, unsigned lo
 	case READ_CACHINGDEV_WB:
 		ASSERT(ci->n_readers > 0);
 		ci->n_readers--;
+		mls->cache_reads++;
 		break;
 	default:
 		break;
@@ -58,8 +59,10 @@ update_cache_state(mlstor_t *mls, job_type_t job_type, bno_t bno_cb, unsigned lo
 			ci->writeback = false;
 			break;
 		case WRITE_CACHINGDEV:
+			mls->cached_blocks++;
 			ci->state = VALID;
 			ci->dirty = true;
+			mls->cache_writes++;
 			break;
 		default:
 			break;
@@ -169,7 +172,7 @@ writeback_cb(mlstor_t *mls, cacheinfo_t *ci, bno_t bno_cb, unsigned long *pflags
 		return;
 	ci->n_readers++;
 	ci->writeback = true;
-	mls->disk_writes1++;
+	mls->writebacks++;
 	req_dmio_job_async(job);
 }
 
@@ -231,7 +234,6 @@ again:
 			WAIT_INPROG_EVENT(mls, *pflags, has_reclaimable_cb(mls, bno_start));
 			goto again;
 		}
-		mls->reclaims++;
 		*pbno_cb = bno_reclaimed;
 	}
 
@@ -288,7 +290,7 @@ cache_read(mlstor_t *mls, struct bio *bio)
 	if (ci->state == VALID) {
 		/* This means that cache read uses a victim cache */
 		mls->cached_blocks--;
-		mls->replace++;
+		mls->replaces_rd++;
 	}
 
 	ci->state = INPROG;
@@ -318,6 +320,7 @@ cache_write(mlstor_t *mls, struct bio *bio)
 
 	if (!cache_lookup(mls, bno_db, &bno_cb, true, &flags)) {
 		if (!IS_FULL_BIO(mls, bio)) {
+			mls->disk_writes++;
 			spin_unlock_irqrestore(&mls->lock, flags);
 			job = new_dmio_job(mls, WRITE_BACKINGDEV, bio, bno_db, INVALID_BNO);
 			req_dmio_job(job);
@@ -329,7 +332,7 @@ cache_write(mlstor_t *mls, struct bio *bio)
 
 	if (ci->state == VALID) {
 		mls->cached_blocks--;
-		mls->cache_wr_replace++;
+		mls->replaces_wr++;
 	}
 
 	ci->state = INPROG;
@@ -470,9 +473,9 @@ init_mlstor(mlstor_t *mls, unsigned long size_cache, unsigned int assoc)
 	mls->reads = 0;
 	mls->writes = 0;
 	mls->cache_hits = 0;
-	mls->replace = 0;
+	mls->replaces_rd = 0;
+	mls->replaces_wr = 0;
 	mls->cached_blocks = 0;
-	mls->cache_wr_replace = 0;
 
 	if (size_cache == 0)
 		size_dcache = to_sector(mls->dev_caching->bdev->bd_inode->i_size);
@@ -622,8 +625,8 @@ mlstor_dtr(struct dm_target *ti)
 	if (mls->reads + mls->writes > 0) {
 		DMINFO("stats:\n\treads(%lu), writes(%lu)\n",
 		       mls->reads, mls->writes);
-		DMINFO("\tcache hits(%lu), replacement(%lu), write replacement(%lu)\n",
-		       mls->cache_hits, mls->replace, mls->cache_wr_replace);
+		DMINFO("\tcache hits(%lu), replaces for read(%lu), replaces for write(%lu)\n",
+		       mls->cache_hits, mls->replaces_rd, mls->replaces_wr);
 		DMINFO("conf:\n\tcapacity(%luM), associativity(%u), block size(%uK)\n"
 		       "\ttotal blocks(%lu)\n",
 		       (unsigned long)cs->size * mls->block_size >> 11,
@@ -640,14 +643,14 @@ mlstor_status_info(mlstor_t *mls, status_type_t type, char *result, unsigned int
 	int	sz = 0;
 
 	DMEMIT("stats:\n\treads(%lu), writes(%lu)\n", mls->reads, mls->writes);
-	DMEMIT("\tcache hits(%lu), replacement(%lu), write replacement(%lu)\n"
-		"\tdisk reads(%lu), disk writes(%lu,%lu)\n"
-		"\tcache reads(%lu), cache writes(%lu)\n"
-		"\treclaims(%lu)\n",
-		mls->cache_hits, mls->replace, mls->cache_wr_replace,
-	       mls->disk_reads, mls->disk_writes, mls->disk_writes1,
-	       mls->cache_reads, mls->cache_writes,
-	       mls->reclaims);
+	DMEMIT("\tcache hits(%lu), replaces for read(%lu), replaces for write(%lu)\n"
+	       "\tdisk reads(%lu), disk writes(%lu)\n"
+	       "\twritebacks(%lu)\n"
+	       "\tcache reads(%lu), cache writes(%lu)\n",
+	       mls->cache_hits, mls->replaces_rd, mls->replaces_wr,
+	       mls->disk_reads, mls->disk_writes,
+	       mls->writebacks,
+	       mls->cache_reads, mls->cache_writes);
 }
 
 static void

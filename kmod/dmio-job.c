@@ -48,6 +48,7 @@ dmio_done(unsigned long err, void *context)
 
 	if (err == 0) {
 		if (job->type == READ_CACHINGDEV_WB) {
+			mls->disk_writes++;	/* TODO: locking ? */
 			job->type = WRITE_BACKINGDEV_WB;
 			job->dm_iorgn.bdev = mls->dev_backing->bdev;
 			job->dm_iorgn.sector = BNO_TO_SECTOR(mls, job->bno_db);

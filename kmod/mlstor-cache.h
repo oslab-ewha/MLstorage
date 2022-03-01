@@ -54,7 +54,6 @@ typedef struct _mlstor {
 
 	struct dm_io_client	*io_client;
 
-	unsigned long	reads, writes;
 	unsigned int	assoc;
 	unsigned int	block_size;
 	unsigned int	block_shift;
@@ -64,12 +63,13 @@ typedef struct _mlstor {
 	wait_queue_head_t	job_idleq;	/* wait queue for I/O completion */
 
 	/* Stats */
+	unsigned long	reads, writes;
 	unsigned long	cache_hits;
-	unsigned long	replace;
+	unsigned long	replaces_rd, replaces_wr;
 	unsigned long	cached_blocks;
-	unsigned long	cache_wr_replace;
 	unsigned long	cache_reads, cache_writes;
-	unsigned long	disk_reads, disk_writes, disk_writes1, reclaims;
+	unsigned long	writebacks;
+	unsigned long	disk_reads, disk_writes;
 
 	char	devname_backing[DEV_PATHLEN];
 	char	devname_caching[DEV_PATHLEN];
